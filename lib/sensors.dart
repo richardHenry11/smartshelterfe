@@ -47,6 +47,7 @@ class _SensorsPageState extends State<SensorsPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      extendBody: true,
       body: Container(
         decoration: const BoxDecoration(
           gradient: LinearGradient(
@@ -57,28 +58,124 @@ class _SensorsPageState extends State<SensorsPage> {
         ),
         child: SafeArea(child: _widgetOptions.elementAt(_selectedIndex)),
       ),
-      bottomNavigationBar: BottomNavigationBar(
-        items: const <BottomNavigationBarItem>[
-          BottomNavigationBarItem(
-            icon: Icon(Icons.dashboard_rounded),
-            label: 'Dashboard',
+      bottomNavigationBar: _buildModernBottomNavBar(),
+    );
+  }
+
+  Widget _buildModernBottomNavBar() {
+    final navItems = [
+      (icon: Icons.dashboard_rounded, label: 'Dashboard'),
+      (icon: Icons.location_on_rounded, label: 'Location'),
+      (icon: Icons.person_rounded, label: 'Profile'),
+    ];
+
+    return SafeArea(
+      top: false,
+      child: Container(
+        height: 64,
+        margin: const EdgeInsets.fromLTRB(20, 0, 20, 16),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(28),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.35),
+              blurRadius: 20,
+              offset: const Offset(0, 8),
+            ),
+            BoxShadow(
+              color: const Color(0xFF00E5FF).withValues(alpha: 0.08),
+              blurRadius: 15,
+              spreadRadius: -2,
+            ),
+          ],
+        ),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(28),
+          child: BackdropFilter(
+            filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  colors: [
+                    const Color(0xFF152A55).withValues(alpha: 0.88),
+                    const Color(0xFF0D1B36).withValues(alpha: 0.92),
+                  ],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                ),
+                borderRadius: BorderRadius.circular(28),
+                border: Border.all(
+                  color: Colors.white.withValues(alpha: 0.16),
+                  width: 1.2,
+                ),
+              ),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceAround,
+                children: List.generate(navItems.length, (index) {
+                  final item = navItems[index];
+                  final isSelected = _selectedIndex == index;
+
+                  return GestureDetector(
+                    onTap: () => _onItemTapped(index),
+                    behavior: HitTestBehavior.opaque,
+                    child: AnimatedContainer(
+                      duration: const Duration(milliseconds: 280),
+                      curve: Curves.easeOutCubic,
+                      padding: EdgeInsets.symmetric(
+                        horizontal: isSelected ? 18 : 12,
+                        vertical: 8,
+                      ),
+                      decoration: BoxDecoration(
+                        gradient: isSelected
+                            ? LinearGradient(
+                                colors: [
+                                  const Color(0xFF00E5FF).withValues(alpha: 0.22),
+                                  const Color(0xFF2A5298).withValues(alpha: 0.30),
+                                ],
+                                begin: Alignment.topLeft,
+                                end: Alignment.bottomRight,
+                              )
+                            : null,
+                        borderRadius: BorderRadius.circular(20),
+                        border: isSelected
+                            ? Border.all(
+                                color: const Color(0xFF00E5FF).withValues(alpha: 0.45),
+                                width: 1.2,
+                              )
+                            : Border.all(color: Colors.transparent, width: 1.2),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            item.icon,
+                            color: isSelected
+                                ? const Color(0xFF00E5FF)
+                                : Colors.white.withValues(alpha: 0.55),
+                            size: 22,
+                          ),
+                          if (isSelected) ...[
+                            const SizedBox(width: 8),
+                            Text(
+                              item.label,
+                              style: const TextStyle(
+                                color: Color(0xFF00E5FF),
+                                fontWeight: FontWeight.bold,
+                                fontSize: 13,
+                                letterSpacing: 0.3,
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                  );
+                }),
+              ),
+            ),
           ),
-          BottomNavigationBarItem(
-            icon: Icon(Icons.location_on_rounded),
-            label: 'Location',
-          ),
-          BottomNavigationBarItem(
-            icon: Icon(Icons.person_rounded),
-            label: 'Profile',
-          ),
-        ],
-        currentIndex: _selectedIndex,
-        selectedItemColor: const Color(0xFF2A5298),
-        unselectedItemColor: Colors.grey,
-        onTap: _onItemTapped,
-        backgroundColor: Colors.white,
-        elevation: 10,
-        type: BottomNavigationBarType.fixed,
+        ),
       ),
     );
   }
@@ -218,6 +315,10 @@ class _DashboardTabState extends State<DashboardTab> {
   List<SensorMeta> sensors = [];
   String _selectedSensorKey = 'nh4';
 
+  // Kustomisasi Nama & Deskripsi Aplikasi
+  String appTitle = 'Sensor Dashboard';
+  String appSubtitle = 'Live metrics from your smart shelter';
+
   // State untuk Line Chart
   List<FlSpot> historySpots = [];
   List<String> historyTimeLabels = [];
@@ -241,7 +342,31 @@ class _DashboardTabState extends State<DashboardTab> {
   void initState() {
     super.initState();
     _loadSensors();
+    _loadAppCustomization();
     _connectMqtt();
+  }
+
+  Future<void> _loadAppCustomization() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (mounted) {
+      setState(() {
+        appTitle = prefs.getString('app_title') ?? 'Sensor Dashboard';
+        appSubtitle = prefs.getString('app_subtitle') ??
+            'Live metrics from your smart shelter';
+      });
+    }
+  }
+
+  Future<void> _saveAppCustomization(String title, String subtitle) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('app_title', title);
+    await prefs.setString('app_subtitle', subtitle);
+    if (mounted) {
+      setState(() {
+        appTitle = title;
+        appSubtitle = subtitle;
+      });
+    }
   }
 
   Future<void> _loadSensors() async {
@@ -429,6 +554,115 @@ class _DashboardTabState extends State<DashboardTab> {
         builder.payload!,
       );
     }
+  }
+
+  void _showEditAppTitleDialog() {
+    final titleCtrl = TextEditingController(text: appTitle);
+    final subtitleCtrl = TextEditingController(text: appSubtitle);
+
+    showDialog(
+      context: context,
+      builder: (ctx) {
+        return AlertDialog(
+          backgroundColor: const Color(0xFF1E3C72),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(24),
+          ),
+          title: const Row(
+            children: [
+              Icon(Icons.tune_rounded, color: Colors.amberAccent),
+              SizedBox(width: 8),
+              Text(
+                'Kustomisasi Aplikasi',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ],
+          ),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                TextField(
+                  controller: titleCtrl,
+                  style: const TextStyle(color: Colors.white),
+                  decoration: InputDecoration(
+                    labelText: 'Nama Aplikasi / Dashboard',
+                    hintText: 'Contoh: Smart Shelter Monitoring',
+                    labelStyle: const TextStyle(color: Colors.white70),
+                    hintStyle: const TextStyle(color: Colors.white38),
+                    filled: true,
+                    fillColor: Colors.white.withValues(alpha: 0.1),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                TextField(
+                  controller: subtitleCtrl,
+                  maxLines: 2,
+                  style: const TextStyle(color: Colors.white),
+                  decoration: InputDecoration(
+                    labelText: 'Deskripsi Singkat',
+                    hintText: 'Contoh: Live metrics from your smart shelter',
+                    labelStyle: const TextStyle(color: Colors.white70),
+                    hintStyle: const TextStyle(color: Colors.white38),
+                    filled: true,
+                    fillColor: Colors.white.withValues(alpha: 0.1),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                titleCtrl.text = 'Sensor Dashboard';
+                subtitleCtrl.text = 'Live metrics from your smart shelter';
+              },
+              child: const Text(
+                'Reset Default',
+                style: TextStyle(color: Colors.orangeAccent),
+              ),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Batal', style: TextStyle(color: Colors.white60)),
+            ),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.blueAccent,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+              ),
+              onPressed: () {
+                final newTitle = titleCtrl.text.trim();
+                final newSubtitle = subtitleCtrl.text.trim();
+                if (newTitle.isNotEmpty) {
+                  _saveAppCustomization(
+                    newTitle,
+                    newSubtitle.isNotEmpty
+                        ? newSubtitle
+                        : 'Live metrics from your smart shelter',
+                  );
+                }
+                Navigator.pop(ctx);
+              },
+              child: const Text('Simpan', style: TextStyle(color: Colors.white)),
+            ),
+          ],
+        );
+      },
+    );
   }
 
   void _showAddSensorDialog() {
@@ -785,38 +1019,46 @@ class _DashboardTabState extends State<DashboardTab> {
           Row(
             crossAxisAlignment: CrossAxisAlignment.center,
             children: [
-              const Expanded(
+              Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      'Sensor Dashboard',
-                      style: TextStyle(
+                      appTitle,
+                      style: const TextStyle(
                         fontSize: 28,
                         fontWeight: FontWeight.bold,
                         color: Colors.white,
                       ),
                     ),
-                    SizedBox(height: 4),
+                    const SizedBox(height: 4),
                     Text(
-                      'Live metrics from your smart shelter',
-                      style: TextStyle(fontSize: 15, color: Colors.white70),
+                      appSubtitle,
+                      style: const TextStyle(fontSize: 15, color: Colors.white70),
                     ),
                   ],
                 ),
               ),
               const SizedBox(width: 8),
               IconButton(
-                onPressed: _showAddSensorDialog,
+                onPressed: _showEditAppTitleDialog,
                 icon: Container(
                   padding: const EdgeInsets.all(8),
                   decoration: BoxDecoration(
-                    color: Colors.white.withValues(alpha: 0.2),
+                    color: Colors.white.withValues(alpha: 0.15),
                     borderRadius: BorderRadius.circular(12),
+                    border: Border.all(
+                      color: Colors.white.withValues(alpha: 0.25),
+                      width: 1.2,
+                    ),
                   ),
-                  child: const Icon(Icons.add, color: Colors.white),
+                  child: const Icon(
+                    Icons.tune_rounded,
+                    color: Colors.white,
+                    size: 22,
+                  ),
                 ),
-                tooltip: 'Tambah Sensor Baru',
+                tooltip: 'Kustomisasi Nama & Deskripsi Aplikasi',
               ),
             ],
           ),
@@ -1068,54 +1310,79 @@ class _DashboardTabState extends State<DashboardTab> {
                           style: TextStyle(color: Colors.white70),
                         ),
                       )
-                    : LineChart(
-                        LineChartData(
-                          gridData: const FlGridData(show: false),
-                          titlesData: FlTitlesData(
-                            leftTitles: const AxisTitles(
-                              sideTitles: SideTitles(showTitles: false),
-                            ),
-                            topTitles: const AxisTitles(
-                              sideTitles: SideTitles(showTitles: false),
-                            ),
-                            rightTitles: const AxisTitles(
-                              sideTitles: SideTitles(showTitles: false),
-                            ),
-                            bottomTitles: AxisTitles(
-                              sideTitles: SideTitles(
-                                showTitles: true,
-                                reservedSize: 24,
-                                getTitlesWidget: (value, meta) {
-                                  int index = value.toInt();
-                                  if (index >= 0 &&
-                                      index < historyTimeLabels.length) {
-                                    int step = (historyTimeLabels.length / 5)
-                                        .ceil()
-                                        .clamp(1, 10);
-                                    if (index % step == 0 ||
-                                        index == historyTimeLabels.length - 1) {
-                                      return Padding(
-                                        padding: const EdgeInsets.only(
-                                          top: 6.0,
-                                        ),
-                                        child: Text(
-                                          historyTimeLabels[index],
-                                          style: const TextStyle(
-                                            color: Colors.white70,
-                                            fontSize: 10,
-                                          ),
-                                        ),
-                                      );
-                                    }
-                                  }
-                                  return const SizedBox.shrink();
-                                },
+                    : Builder(
+                        builder: (context) {
+                          double? computedMinY;
+                          double? computedMaxY;
+                          if (historySpots.isNotEmpty) {
+                            final yValues = historySpots.map((s) => s.y).toList();
+                            final minYVal = yValues.reduce((a, b) => a < b ? a : b);
+                            final maxYVal = yValues.reduce((a, b) => a > b ? a : b);
+                            final diff = maxYVal - minYVal;
+                            final padding = diff > 0 ? diff * 0.2 : (maxYVal == 0 ? 1.0 : maxYVal.abs() * 0.2);
+                            computedMinY = (minYVal - padding / 2).clamp(0, double.infinity);
+                            computedMaxY = maxYVal + padding;
+                          }
+
+                          return LineChart(
+                            LineChartData(
+                              minY: computedMinY,
+                              maxY: computedMaxY,
+                              gridData: const FlGridData(show: false),
+                              titlesData: FlTitlesData(
+                                leftTitles: const AxisTitles(
+                                  sideTitles: SideTitles(showTitles: false),
+                                ),
+                                topTitles: const AxisTitles(
+                                  sideTitles: SideTitles(showTitles: false),
+                                ),
+                                rightTitles: const AxisTitles(
+                                  sideTitles: SideTitles(showTitles: false),
+                                ),
+                                bottomTitles: AxisTitles(
+                                  sideTitles: SideTitles(
+                                    showTitles: true,
+                                    reservedSize: 24,
+                                    getTitlesWidget: (value, meta) {
+                                      int index = value.toInt();
+                                      if (index >= 0 &&
+                                          index < historyTimeLabels.length) {
+                                        int step = (historyTimeLabels.length / 5)
+                                            .ceil()
+                                            .clamp(1, 10);
+                                        if (index % step == 0 ||
+                                            index == historyTimeLabels.length - 1) {
+                                          return Padding(
+                                            padding: const EdgeInsets.only(
+                                              top: 6.0,
+                                            ),
+                                            child: Text(
+                                              historyTimeLabels[index],
+                                              style: const TextStyle(
+                                                color: Colors.white70,
+                                                fontSize: 10,
+                                              ),
+                                            ),
+                                          );
+                                        }
+                                      }
+                                      return const SizedBox.shrink();
+                                    },
+                                  ),
+                                ),
                               ),
-                            ),
-                          ),
-                          borderData: FlBorderData(show: false),
-                          lineTouchData: LineTouchData(
-                            touchTooltipData: LineTouchTooltipData(
+                              borderData: FlBorderData(show: false),
+                              lineTouchData: LineTouchData(
+                                handleBuiltInTouches: true,
+                                touchTooltipData: LineTouchTooltipData(
+                                  fitInsideHorizontally: true,
+                                  fitInsideVertically: true,
+                                  getTooltipColor: (touchedSpot) => const Color(0xFF37474F).withValues(alpha: 0.95),
+                                  tooltipBorderRadius: BorderRadius.circular(10),
+                                  tooltipPadding: const EdgeInsets.symmetric(
+                                    horizontal: 12,
+                                    vertical: 8,
+                                  ),
                               getTooltipItems: (touchedSpots) {
                                 return touchedSpots.map((spot) {
                                   int idx = spot.x.toInt();
@@ -1129,6 +1396,8 @@ class _DashboardTabState extends State<DashboardTab> {
                                     const TextStyle(
                                       color: Colors.white,
                                       fontWeight: FontWeight.bold,
+                                      fontSize: 13,
+                                      height: 1.3,
                                     ),
                                   );
                                 }).toList();
@@ -1152,11 +1421,13 @@ class _DashboardTabState extends State<DashboardTab> {
                             ),
                           ],
                         ),
-                      ),
+                      );
+                    },
+                  ),
               ),
             ),
           ),
-          const SizedBox(height: 32),
+          const SizedBox(height: 90),
         ],
       ),
     );
@@ -2398,7 +2669,7 @@ class _LocationTabState extends State<LocationTab> {
             ],
           ),
           */
-          const SizedBox(height: 32),
+          const SizedBox(height: 90),
         ],
       ),
     );
