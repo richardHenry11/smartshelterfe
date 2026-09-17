@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+
 import 'dart:async';
 import 'dart:ui';
 
@@ -130,8 +131,10 @@ class _SensorsPageState extends State<SensorsPage> {
                         gradient: isSelected
                             ? LinearGradient(
                                 colors: [
-                                  const Color(0xFF00E5FF).withValues(alpha: 0.22),
-                                  const Color(0xFF2A5298).withValues(alpha: 0.30),
+                                  const Color(0xFF00E5FF)
+                                      .withValues(alpha: 0.22),
+                                  const Color(0xFF2A5298)
+                                      .withValues(alpha: 0.30),
                                 ],
                                 begin: Alignment.topLeft,
                                 end: Alignment.bottomRight,
@@ -140,7 +143,8 @@ class _SensorsPageState extends State<SensorsPage> {
                         borderRadius: BorderRadius.circular(20),
                         border: isSelected
                             ? Border.all(
-                                color: const Color(0xFF00E5FF).withValues(alpha: 0.45),
+                                color: const Color(0xFF00E5FF)
+                                    .withValues(alpha: 0.45),
                                 width: 1.2,
                               )
                             : Border.all(color: Colors.transparent, width: 1.2),
@@ -293,6 +297,47 @@ final List<SensorMeta> defaultSensors = [
   ),
 ];
 
+// ---------------- MODEL SHELTER / MULTI-TENANT ----------------
+class ShelterData {
+  final String id;
+  final String name;
+  final double? latitude;
+  final double? longitude;
+  final double geofenceRadius;
+
+  ShelterData({
+    required this.id,
+    required this.name,
+    this.latitude,
+    this.longitude,
+    this.geofenceRadius = 100.0,
+  });
+
+  factory ShelterData.fromJson(Map<String, dynamic> json) {
+    return ShelterData(
+      id: json['id']?.toString() ?? 'SHELTER-01',
+      name: json['name']?.toString() ?? 'Shelter Site',
+      latitude: json['latitude'] != null
+          ? (json['latitude'] as num).toDouble()
+          : null,
+      longitude: json['longitude'] != null
+          ? (json['longitude'] as num).toDouble()
+          : null,
+      geofenceRadius: json['geofence_radius'] != null
+          ? (json['geofence_radius'] as num).toDouble()
+          : 100.0,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'name': name,
+        'latitude': latitude,
+        'longitude': longitude,
+        'geofence_radius': geofenceRadius,
+      };
+}
+
 // ---------------- DASHBOARD TAB ----------------
 class DashboardTab extends StatefulWidget {
   const DashboardTab({super.key});
@@ -303,6 +348,25 @@ class DashboardTab extends StatefulWidget {
 
 class _DashboardTabState extends State<DashboardTab> {
   MqttServerClient? client;
+
+  // Multi-Tenant / Multi-Shelter state
+  String currentShelterId = 'SHELTER-01';
+  List<ShelterData> availableShelters = [
+    ShelterData(
+      id: 'SHELTER-01',
+      name: 'Shelter Site Alpha (Pusat)',
+      latitude: -6.90240000,
+      longitude: 107.61870000,
+      geofenceRadius: 100,
+    ),
+    ShelterData(
+      id: 'SHELTER-02',
+      name: 'Shelter Site Beta (Cabang)',
+      latitude: -6.91474400,
+      longitude: 107.60981000,
+      geofenceRadius: 150,
+    ),
+  ];
 
   // Dynamic Realtime sensor values: {"nh4": "1.2", "o2": "20.9", ...}
   Map<String, String> sensorValues = {};
@@ -342,8 +406,94 @@ class _DashboardTabState extends State<DashboardTab> {
   void initState() {
     super.initState();
     _loadSensors();
+    _loadShelters();
     _loadAppCustomization();
     _connectMqtt();
+  }
+
+  Future<void> _loadShelters() async {
+    final prefs = await SharedPreferences.getInstance();
+    final savedShelterId = prefs.getString('current_shelter_id');
+    final savedSheltersJson = prefs.getString('available_shelters');
+
+    if (savedSheltersJson != null && savedSheltersJson.isNotEmpty) {
+      try {
+        final List<dynamic> decoded = jsonDecode(savedSheltersJson);
+        final loaded = decoded.map((e) => ShelterData.fromJson(e)).toList();
+        if (loaded.isNotEmpty && mounted) {
+          setState(() {
+            availableShelters = loaded;
+          });
+        }
+      } catch (e) {
+        print('Error decoding saved shelters: $e');
+      }
+    }
+
+    if (savedShelterId != null && mounted) {
+      setState(() {
+        currentShelterId = savedShelterId;
+      });
+    }
+
+    _fetchSheltersFromApi();
+  }
+
+  Future<void> _fetchSheltersFromApi() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final tenantId = prefs.getString('tenant_id');
+      final url = tenantId != null && tenantId.isNotEmpty
+          ? 'https://shelter.cbinstrument.com/shelters?tenant_id=$tenantId'
+          : 'https://shelter.cbinstrument.com/shelters';
+
+      final response =
+          await http.get(Uri.parse(url)).timeout(const Duration(seconds: 5));
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        final List<dynamic> list = data['shelters'] ?? [];
+        if (list.isNotEmpty && mounted) {
+          final loaded = list.map((e) => ShelterData.fromJson(e)).toList();
+          setState(() {
+            availableShelters = loaded;
+          });
+          await prefs.setString('available_shelters', jsonEncode(list));
+        }
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _changeShelter(String newShelterId) async {
+    if (newShelterId == currentShelterId) return;
+
+    final oldShelterId = currentShelterId;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('current_shelter_id', newShelterId);
+
+    // Unsubscribe shelter lama, subscribe shelter baru di MQTT
+    if (client?.connectionStatus?.state == MqttConnectionState.connected) {
+      client?.unsubscribe('shelter/$oldShelterId/sensors');
+      client?.subscribe('shelter/$newShelterId/sensors', MqttQos.atLeastOnce);
+    }
+
+    // Cari koordinat shelter baru untuk update geofence otomatis
+    final newShelter = availableShelters.firstWhere(
+      (s) => s.id == newShelterId,
+      orElse: () => ShelterData(id: newShelterId, name: newShelterId),
+    );
+    if (newShelter.latitude != null && newShelter.longitude != null) {
+      await prefs.setDouble('shelter_lat', newShelter.latitude!);
+      await prefs.setDouble('shelter_lng', newShelter.longitude!);
+      await prefs.setDouble('shelter_radius', newShelter.geofenceRadius);
+    }
+
+    if (mounted) {
+      setState(() {
+        currentShelterId = newShelterId;
+        sensorValues = {};
+      });
+      _fetchHistory(selectedSensor.key);
+    }
   }
 
   Future<void> _loadAppCustomization() async {
@@ -351,7 +501,8 @@ class _DashboardTabState extends State<DashboardTab> {
     if (mounted) {
       setState(() {
         appTitle = prefs.getString('app_title') ?? 'Sensor Dashboard';
-        appSubtitle = prefs.getString('app_subtitle') ??
+        appSubtitle =
+            prefs.getString('app_subtitle') ??
             'Live metrics from your smart shelter';
       });
     }
@@ -429,7 +580,7 @@ class _DashboardTabState extends State<DashboardTab> {
     try {
       final response = await http.get(
         Uri.parse(
-          'https://shelter.cbinstrument.com/sensor/history/$sensorType?limit=24',
+          'https://shelter.cbinstrument.com/sensor/history/$sensorType?shelter_id=$currentShelterId&limit=24',
         ),
       );
       if (response.statusCode == 200) {
@@ -515,7 +666,7 @@ class _DashboardTabState extends State<DashboardTab> {
 
     if (client!.connectionStatus!.state == MqttConnectionState.connected) {
       print('MQTT client connected');
-      client!.subscribe('shelter/SHELTER-01/sensors', MqttQos.atLeastOnce);
+      client!.subscribe('shelter/$currentShelterId/sensors', MqttQos.atLeastOnce);
 
       client!.updates!.listen((List<MqttReceivedMessage<MqttMessage>> c) {
         final MqttPublishMessage recMess = c[0].payload as MqttPublishMessage;
@@ -549,7 +700,7 @@ class _DashboardTabState extends State<DashboardTab> {
       final jsonPayload = jsonEncode({"command": commandName});
       builder.addString(jsonPayload);
       client!.publishMessage(
-        'shelter/SHELTER-01/command',
+        'shelter/$currentShelterId/command',
         MqttQos.atLeastOnce,
         builder.payload!,
       );
@@ -635,7 +786,10 @@ class _DashboardTabState extends State<DashboardTab> {
             ),
             TextButton(
               onPressed: () => Navigator.pop(ctx),
-              child: const Text('Batal', style: TextStyle(color: Colors.white60)),
+              child: const Text(
+                'Batal',
+                style: TextStyle(color: Colors.white60),
+              ),
             ),
             ElevatedButton(
               style: ElevatedButton.styleFrom(
@@ -657,9 +811,185 @@ class _DashboardTabState extends State<DashboardTab> {
                 }
                 Navigator.pop(ctx);
               },
-              child: const Text('Simpan', style: TextStyle(color: Colors.white)),
+              child: const Text(
+                'Simpan',
+                style: TextStyle(color: Colors.white),
+              ),
             ),
           ],
+        );
+      },
+    );
+  }
+
+  Widget _buildShelterSelectorChip() {
+    final activeShelter = availableShelters.firstWhere(
+      (s) => s.id == currentShelterId,
+      orElse: () => ShelterData(id: currentShelterId, name: currentShelterId),
+    );
+
+    return InkWell(
+      onTap: _showShelterSelectorModal,
+      borderRadius: BorderRadius.circular(20),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        decoration: BoxDecoration(
+          color: const Color(0xFF00E5FF).withValues(alpha: 0.15),
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(
+            color: const Color(0xFF00E5FF).withValues(alpha: 0.4),
+            width: 1.0,
+          ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(
+              Icons.location_city_rounded,
+              size: 15,
+              color: Color(0xFF00E5FF),
+            ),
+            const SizedBox(width: 6),
+            Text(
+              '${activeShelter.name} (${activeShelter.id})',
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(width: 4),
+            const Icon(
+              Icons.arrow_drop_down_rounded,
+              size: 18,
+              color: Colors.white70,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showShelterSelectorModal() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
+      builder: (ctx) {
+        return Container(
+          padding: const EdgeInsets.fromLTRB(24, 20, 24, 32),
+          decoration: const BoxDecoration(
+            color: Color(0xFF1E3C72),
+            borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Center(
+                child: Container(
+                  width: 40,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: Colors.white30,
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 18),
+              const Row(
+                children: [
+                  Icon(Icons.location_city_rounded, color: Colors.cyanAccent),
+                  SizedBox(width: 10),
+                  Text(
+                    'Pilih Smart Shelter / Site',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Data sensor real-time, grafik riwayat, dan kontrol aktuator otomatis terisolasi untuk site yang dipilih.',
+                style: TextStyle(color: Colors.white70, fontSize: 12),
+              ),
+              const SizedBox(height: 16),
+              Flexible(
+                child: ListView.builder(
+                  shrinkWrap: true,
+                  itemCount: availableShelters.length,
+                  itemBuilder: (context, index) {
+                    final s = availableShelters[index];
+                    final isSelected = s.id == currentShelterId;
+                    return Container(
+                      margin: const EdgeInsets.only(bottom: 10),
+                      decoration: BoxDecoration(
+                        color: isSelected
+                            ? Colors.cyanAccent.withValues(alpha: 0.15)
+                            : Colors.white.withValues(alpha: 0.06),
+                        borderRadius: BorderRadius.circular(16),
+                        border: Border.all(
+                          color: isSelected
+                              ? Colors.cyanAccent
+                              : Colors.white.withValues(alpha: 0.15),
+                          width: isSelected ? 1.5 : 1.0,
+                        ),
+                      ),
+                      child: ListTile(
+                        onTap: () {
+                          Navigator.pop(ctx);
+                          _changeShelter(s.id);
+                        },
+                        leading: Container(
+                          padding: const EdgeInsets.all(8),
+                          decoration: BoxDecoration(
+                            color: isSelected
+                                ? Colors.cyanAccent.withValues(alpha: 0.2)
+                                : Colors.white.withValues(alpha: 0.1),
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: Icon(
+                            Icons.home_work_rounded,
+                            color: isSelected
+                                ? Colors.cyanAccent
+                                : Colors.white70,
+                          ),
+                        ),
+                        title: Text(
+                          s.name,
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontWeight: isSelected
+                                ? FontWeight.bold
+                                : FontWeight.w600,
+                          ),
+                        ),
+                        subtitle: Text(
+                          'ID: ${s.id}${s.latitude != null ? " • Lat: ${s.latitude!.toStringAsFixed(4)}, Lng: ${s.longitude!.toStringAsFixed(4)}" : ""}',
+                          style: const TextStyle(
+                            color: Colors.white54,
+                            fontSize: 11,
+                          ),
+                        ),
+                        trailing: isSelected
+                            ? const Icon(
+                                Icons.check_circle_rounded,
+                                color: Colors.cyanAccent,
+                              )
+                            : const Icon(
+                                Icons.radio_button_unchecked_rounded,
+                                color: Colors.white38,
+                              ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
         );
       },
     );
@@ -1034,8 +1364,13 @@ class _DashboardTabState extends State<DashboardTab> {
                     const SizedBox(height: 4),
                     Text(
                       appSubtitle,
-                      style: const TextStyle(fontSize: 15, color: Colors.white70),
+                      style: const TextStyle(
+                        fontSize: 15,
+                        color: Colors.white70,
+                      ),
                     ),
+                    const SizedBox(height: 10),
+                    _buildShelterSelectorChip(),
                   ],
                 ),
               ),
@@ -1315,12 +1650,23 @@ class _DashboardTabState extends State<DashboardTab> {
                           double? computedMinY;
                           double? computedMaxY;
                           if (historySpots.isNotEmpty) {
-                            final yValues = historySpots.map((s) => s.y).toList();
-                            final minYVal = yValues.reduce((a, b) => a < b ? a : b);
-                            final maxYVal = yValues.reduce((a, b) => a > b ? a : b);
+                            final yValues = historySpots
+                                .map((s) => s.y)
+                                .toList();
+                            final minYVal = yValues.reduce(
+                              (a, b) => a < b ? a : b,
+                            );
+                            final maxYVal = yValues.reduce(
+                              (a, b) => a > b ? a : b,
+                            );
                             final diff = maxYVal - minYVal;
-                            final padding = diff > 0 ? diff * 0.2 : (maxYVal == 0 ? 1.0 : maxYVal.abs() * 0.2);
-                            computedMinY = (minYVal - padding / 2).clamp(0, double.infinity);
+                            final padding = diff > 0
+                                ? diff * 0.2
+                                : (maxYVal == 0 ? 1.0 : maxYVal.abs() * 0.2);
+                            computedMinY = (minYVal - padding / 2).clamp(
+                              0,
+                              double.infinity,
+                            );
                             computedMaxY = maxYVal + padding;
                           }
 
@@ -1347,11 +1693,13 @@ class _DashboardTabState extends State<DashboardTab> {
                                       int index = value.toInt();
                                       if (index >= 0 &&
                                           index < historyTimeLabels.length) {
-                                        int step = (historyTimeLabels.length / 5)
-                                            .ceil()
-                                            .clamp(1, 10);
+                                        int step =
+                                            (historyTimeLabels.length / 5)
+                                                .ceil()
+                                                .clamp(1, 10);
                                         if (index % step == 0 ||
-                                            index == historyTimeLabels.length - 1) {
+                                            index ==
+                                                historyTimeLabels.length - 1) {
                                           return Padding(
                                             padding: const EdgeInsets.only(
                                               top: 6.0,
@@ -1377,53 +1725,57 @@ class _DashboardTabState extends State<DashboardTab> {
                                 touchTooltipData: LineTouchTooltipData(
                                   fitInsideHorizontally: true,
                                   fitInsideVertically: true,
-                                  getTooltipColor: (touchedSpot) => const Color(0xFF37474F).withValues(alpha: 0.95),
-                                  tooltipBorderRadius: BorderRadius.circular(10),
+                                  getTooltipColor: (touchedSpot) =>
+                                      const Color(0xFF37474F)
+                                          .withValues(alpha: 0.95),
+                                  tooltipBorderRadius: BorderRadius.circular(
+                                    10,
+                                  ),
                                   tooltipPadding: const EdgeInsets.symmetric(
                                     horizontal: 12,
                                     vertical: 8,
                                   ),
-                              getTooltipItems: (touchedSpots) {
-                                return touchedSpots.map((spot) {
-                                  int idx = spot.x.toInt();
-                                  String time =
-                                      (idx >= 0 &&
-                                          idx < historyTimeLabels.length)
-                                      ? historyTimeLabels[idx]
-                                      : '';
-                                  return LineTooltipItem(
-                                    '${spot.y} ${selectedSensor.unit}\n$time',
-                                    const TextStyle(
-                                      color: Colors.white,
-                                      fontWeight: FontWeight.bold,
-                                      fontSize: 13,
-                                      height: 1.3,
-                                    ),
-                                  );
-                                }).toList();
-                              },
-                            ),
-                          ),
-                          lineBarsData: [
-                            LineChartBarData(
-                              spots: historySpots,
-                              isCurved: true,
-                              color: selectedSensor.color,
-                              barWidth: 4,
-                              isStrokeCapRound: true,
-                              dotData: const FlDotData(show: false),
-                              belowBarData: BarAreaData(
-                                show: true,
-                                color: selectedSensor.color.withValues(
-                                  alpha: 0.3,
+                                  getTooltipItems: (touchedSpots) {
+                                    return touchedSpots.map((spot) {
+                                      int idx = spot.x.toInt();
+                                      String time =
+                                          (idx >= 0 &&
+                                              idx < historyTimeLabels.length)
+                                          ? historyTimeLabels[idx]
+                                          : '';
+                                      return LineTooltipItem(
+                                        '${spot.y} ${selectedSensor.unit}\n$time',
+                                        const TextStyle(
+                                          color: Colors.white,
+                                          fontWeight: FontWeight.bold,
+                                          fontSize: 13,
+                                          height: 1.3,
+                                        ),
+                                      );
+                                    }).toList();
+                                  },
                                 ),
                               ),
+                              lineBarsData: [
+                                LineChartBarData(
+                                  spots: historySpots,
+                                  isCurved: true,
+                                  color: selectedSensor.color,
+                                  barWidth: 4,
+                                  isStrokeCapRound: true,
+                                  dotData: const FlDotData(show: false),
+                                  belowBarData: BarAreaData(
+                                    show: true,
+                                    color: selectedSensor.color.withValues(
+                                      alpha: 0.3,
+                                    ),
+                                  ),
+                                ),
+                              ],
                             ),
-                          ],
-                        ),
-                      );
-                    },
-                  ),
+                          );
+                        },
+                      ),
               ),
             ),
           ),
@@ -1755,6 +2107,7 @@ class LocationTab extends StatefulWidget {
 
 class _LocationTabState extends State<LocationTab> {
   // Titik Target Shelter & Radius (dapat diatur user)
+  String currentShelterId = 'SHELTER-01';
   double shelterLat = -6.951613312233824;
   double shelterLng = 107.53343065982726;
   double thresholdMeters = 150.0; // default 150 meter
@@ -1783,13 +2136,18 @@ class _LocationTabState extends State<LocationTab> {
   Future<void> _loadGeofenceSettings() async {
     final prefs = await SharedPreferences.getInstance();
     setState(() {
+      currentShelterId = prefs.getString('current_shelter_id') ?? 'SHELTER-01';
       shelterLat = prefs.getDouble('shelter_lat') ?? -6.951613312233824;
       shelterLng = prefs.getDouble('shelter_lng') ?? 107.53343065982726;
       thresholdMeters = prefs.getDouble('shelter_radius_m') ?? 150.0;
     });
   }
 
-  Future<void> _saveGeofenceSettings(double lat, double lng, double radiusM) async {
+  Future<void> _saveGeofenceSettings(
+    double lat,
+    double lng,
+    double radiusM,
+  ) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setDouble('shelter_lat', lat);
     await prefs.setDouble('shelter_lng', lng);
@@ -1807,14 +2165,18 @@ class _LocationTabState extends State<LocationTab> {
   void _showEditGeofenceDialog() {
     final latController = TextEditingController(text: shelterLat.toString());
     final lngController = TextEditingController(text: shelterLng.toString());
-    final radiusController = TextEditingController(text: thresholdMeters.toStringAsFixed(0));
+    final radiusController = TextEditingController(
+      text: thresholdMeters.toStringAsFixed(0),
+    );
 
     showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (context, setDialogState) => AlertDialog(
           backgroundColor: const Color(0xFF1E3C72),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(20),
+          ),
           title: const Row(
             children: [
               Icon(Icons.tune_rounded, color: Colors.cyanAccent),
@@ -1822,7 +2184,11 @@ class _LocationTabState extends State<LocationTab> {
               Expanded(
                 child: Text(
                   'Atur Shelter & Radius',
-                  style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold,
+                  ),
                 ),
               ),
             ],
@@ -1839,45 +2205,71 @@ class _LocationTabState extends State<LocationTab> {
                 const SizedBox(height: 16),
                 TextField(
                   controller: latController,
-                  keyboardType: const TextInputType.numberWithOptions(decimal: true, signed: true),
+                  keyboardType: const TextInputType.numberWithOptions(
+                    decimal: true,
+                    signed: true,
+                  ),
                   style: const TextStyle(color: Colors.white),
                   decoration: InputDecoration(
                     labelText: 'Latitude Shelter',
                     labelStyle: const TextStyle(color: Colors.white70),
                     filled: true,
                     fillColor: Colors.white.withValues(alpha: 0.1),
-                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-                    prefixIcon: const Icon(Icons.location_on_outlined, color: Colors.cyanAccent),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    prefixIcon: const Icon(
+                      Icons.location_on_outlined,
+                      color: Colors.cyanAccent,
+                    ),
                   ),
                 ),
                 const SizedBox(height: 12),
                 TextField(
                   controller: lngController,
-                  keyboardType: const TextInputType.numberWithOptions(decimal: true, signed: true),
+                  keyboardType: const TextInputType.numberWithOptions(
+                    decimal: true,
+                    signed: true,
+                  ),
                   style: const TextStyle(color: Colors.white),
                   decoration: InputDecoration(
                     labelText: 'Longitude Shelter',
                     labelStyle: const TextStyle(color: Colors.white70),
                     filled: true,
                     fillColor: Colors.white.withValues(alpha: 0.1),
-                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-                    prefixIcon: const Icon(Icons.location_on_outlined, color: Colors.cyanAccent),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    prefixIcon: const Icon(
+                      Icons.location_on_outlined,
+                      color: Colors.cyanAccent,
+                    ),
                   ),
                 ),
                 const SizedBox(height: 12),
                 TextField(
                   controller: radiusController,
-                  keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                  keyboardType: const TextInputType.numberWithOptions(
+                    decimal: true,
+                  ),
                   style: const TextStyle(color: Colors.white),
                   decoration: InputDecoration(
                     labelText: 'Radius Geofence (Meter)',
                     helperText: 'Contoh: 150 (150 m) atau 2000 (2 km)',
-                    helperStyle: const TextStyle(color: Colors.white54, fontSize: 11),
+                    helperStyle: const TextStyle(
+                      color: Colors.white54,
+                      fontSize: 11,
+                    ),
                     labelStyle: const TextStyle(color: Colors.white70),
                     filled: true,
                     fillColor: Colors.white.withValues(alpha: 0.1),
-                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-                    prefixIcon: const Icon(Icons.radar_rounded, color: Colors.cyanAccent),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    prefixIcon: const Icon(
+                      Icons.radar_rounded,
+                      color: Colors.cyanAccent,
+                    ),
                   ),
                 ),
                 const SizedBox(height: 14),
@@ -1885,12 +2277,16 @@ class _LocationTabState extends State<LocationTab> {
                   style: OutlinedButton.styleFrom(
                     foregroundColor: Colors.cyanAccent,
                     side: const BorderSide(color: Colors.cyanAccent),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(10),
+                    ),
                   ),
                   onPressed: () async {
                     try {
                       final pos = await Geolocator.getCurrentPosition(
-                        locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
+                        locationSettings: const LocationSettings(
+                          accuracy: LocationAccuracy.high,
+                        ),
                       );
                       setDialogState(() {
                         latController.text = pos.latitude.toString();
@@ -1905,7 +2301,10 @@ class _LocationTabState extends State<LocationTab> {
                     }
                   },
                   icon: const Icon(Icons.my_location, size: 16),
-                  label: const Text('Gunakan GPS HP Saat Ini', style: TextStyle(fontSize: 12)),
+                  label: const Text(
+                    'Gunakan GPS HP Saat Ini',
+                    style: TextStyle(fontSize: 12),
+                  ),
                 ),
               ],
             ),
@@ -1913,22 +2312,34 @@ class _LocationTabState extends State<LocationTab> {
           actions: [
             TextButton(
               onPressed: () => Navigator.pop(ctx),
-              child: const Text('Batal', style: TextStyle(color: Colors.white70)),
+              child: const Text(
+                'Batal',
+                style: TextStyle(color: Colors.white70),
+              ),
             ),
             ElevatedButton(
               style: ElevatedButton.styleFrom(
                 backgroundColor: Colors.cyanAccent,
                 foregroundColor: Colors.black87,
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
               ),
               onPressed: () {
                 final lat = double.tryParse(latController.text.trim());
                 final lng = double.tryParse(lngController.text.trim());
                 final radius = double.tryParse(radiusController.text.trim());
 
-                if (lat == null || lng == null || radius == null || radius <= 0) {
+                if (lat == null ||
+                    lng == null ||
+                    radius == null ||
+                    radius <= 0) {
                   ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Format input koordinat atau radius tidak valid!')),
+                    const SnackBar(
+                      content: Text(
+                        'Format input koordinat atau radius tidak valid!',
+                      ),
+                    ),
                   );
                   return;
                 }
@@ -1937,11 +2348,16 @@ class _LocationTabState extends State<LocationTab> {
                 Navigator.pop(ctx);
                 ScaffoldMessenger.of(context).showSnackBar(
                   SnackBar(
-                    content: Text('Pengaturan Shelter & Radius (${radius >= 1000 ? "${(radius / 1000).toStringAsFixed(1)} km" : "${radius.toStringAsFixed(0)} m"}) berhasil disimpan!'),
+                    content: Text(
+                      'Pengaturan Shelter & Radius (${radius >= 1000 ? "${(radius / 1000).toStringAsFixed(1)} km" : "${radius.toStringAsFixed(0)} m"}) berhasil disimpan!',
+                    ),
                   ),
                 );
               },
-              child: const Text('Simpan', style: TextStyle(fontWeight: FontWeight.bold)),
+              child: const Text(
+                'Simpan',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
             ),
           ],
         ),
@@ -1985,7 +2401,7 @@ class _LocationTabState extends State<LocationTab> {
       final builder = MqttClientPayloadBuilder();
       builder.addString(payload);
       client!.publishMessage(
-        'shelter/SHELTER-01/command',
+        'shelter/$currentShelterId/command',
         MqttQos.atLeastOnce,
         builder.payload!,
       );
@@ -2077,23 +2493,24 @@ class _LocationTabState extends State<LocationTab> {
 
       // Pasang live stream GPS agar selalu update saat user berpindah posisi
       _positionStreamSubscription?.cancel();
-      _positionStreamSubscription = Geolocator.getPositionStream(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.high,
-          distanceFilter: 5, // update setiap ada pergerakan 5 meter
-        ),
-      ).listen(
-        (Position pos) {
-          if (mounted) {
-            _evaluateLocation(pos.latitude, pos.longitude);
-          }
-        },
-        onError: (e) {
-          if (mounted) {
-            setState(() => statusMessage = 'Error stream GPS: $e');
-          }
-        },
-      );
+      _positionStreamSubscription =
+          Geolocator.getPositionStream(
+            locationSettings: const LocationSettings(
+              accuracy: LocationAccuracy.high,
+              distanceFilter: 5, // update setiap ada pergerakan 5 meter
+            ),
+          ).listen(
+            (Position pos) {
+              if (mounted) {
+                _evaluateLocation(pos.latitude, pos.longitude);
+              }
+            },
+            onError: (e) {
+              if (mounted) {
+                setState(() => statusMessage = 'Error stream GPS: $e');
+              }
+            },
+          );
     } catch (e) {
       if (mounted) {
         setState(() {
@@ -2166,7 +2583,33 @@ class _LocationTabState extends State<LocationTab> {
                     const SizedBox(height: 4),
                     Text(
                       'Kontrol pintu otomatis berbasis radius $radiusLabel',
-                      style: const TextStyle(fontSize: 13, color: Colors.white70),
+                      style: const TextStyle(
+                        fontSize: 13,
+                        color: Colors.white70,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 3,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.cyanAccent.withValues(alpha: 0.15),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: Colors.cyanAccent.withValues(alpha: 0.3),
+                          width: 0.8,
+                        ),
+                      ),
+                      child: Text(
+                        'Target Site: $currentShelterId',
+                        style: const TextStyle(
+                          color: Colors.cyanAccent,
+                          fontSize: 11,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
                     ),
                   ],
                 ),
@@ -2428,46 +2871,52 @@ class _LocationTabState extends State<LocationTab> {
                             ),
                           ],
                         ),
-                        InkWell(
-                          onTap: _showEditGeofenceDialog,
-                          borderRadius: BorderRadius.circular(8),
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 8,
-                              vertical: 4,
-                            ),
-                            decoration: BoxDecoration(
-                              color: Colors.cyanAccent.withValues(alpha: 0.2),
-                              borderRadius: BorderRadius.circular(8),
-                              border: Border.all(
-                                color: Colors.cyanAccent,
-                                width: 1,
-                              ),
-                            ),
-                            child: const Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Icon(
-                                  Icons.tune_rounded,
-                                  size: 13,
-                                  color: Colors.cyanAccent,
-                                ),
-                                SizedBox(width: 4),
-                                Text(
-                                  'Atur',
-                                  style: TextStyle(
-                                    color: Colors.cyanAccent,
-                                    fontSize: 11,
-                                    fontWeight: FontWeight.bold,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
+                        // InkWell(
+                        //   onTap: _showEditGeofenceDialog,
+                        //   borderRadius: BorderRadius.circular(8),
+                        //   child: Container(
+                        //     padding: const EdgeInsets.symmetric(
+                        //       horizontal: 8,
+                        //       vertical: 4,
+                        //     ),
+                        //     decoration: BoxDecoration(
+                        //       color: Colors.cyanAccent.withValues(alpha: 0.2),
+                        //       borderRadius: BorderRadius.circular(8),
+                        //       border: Border.all(
+                        //         color: Colors.cyanAccent,
+                        //         width: 1,
+                        //       ),
+                        //     ),
+                        //     child: const Row(
+                        //       mainAxisSize: MainAxisSize.min,
+                        //       children: [
+                        //         Icon(
+                        //           Icons.tune_rounded,
+                        //           size: 13,
+                        //           color: Colors.cyanAccent,
+                        //         ),
+                        //         SizedBox(width: 4),
+                        //         Text(
+                        //           'Atur',
+                        //           style: TextStyle(
+                        //             color: Colors.cyanAccent,
+                        //             fontSize: 11,
+                        //             fontWeight: FontWeight.bold,
+                        //           ),
+                        //         ),
+                        //       ],
+                        //     ),
+                        //   ),
+                        // ),
                       ],
                     ),
                     const SizedBox(height: 12),
+                    _buildInfoRow(
+                      'Shelter Aktif:',
+                      currentShelterId,
+                      valColor: Colors.cyanAccent,
+                    ),
+                    const SizedBox(height: 6),
                     _buildInfoRow(
                       'Titik Shelter:',
                       'Lat: ${shelterLat.toStringAsFixed(6)}, Lng: ${shelterLng.toStringAsFixed(6)}',

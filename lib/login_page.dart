@@ -45,8 +45,18 @@ class _LoginPageState extends State<LoginPage> {
         });
 
         if (response.statusCode == 200) {
+          final data = jsonDecode(response.body);
           final prefs = await SharedPreferences.getInstance();
           await prefs.setString('username', _usernameController.text);
+          if (data['tenant_id'] != null) {
+            await prefs.setString('tenant_id', data['tenant_id'].toString());
+          }
+          if (data['shelters'] != null) {
+            await prefs.setString(
+              'available_shelters',
+              jsonEncode(data['shelters']),
+            );
+          }
           
           if (!mounted) return;
           Navigator.pushReplacement(
