@@ -5,6 +5,7 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'config.dart';
 import 'sensors.dart';
 
 class LoginPage extends StatefulWidget {
@@ -28,9 +29,8 @@ class _LoginPageState extends State<LoginPage> {
       });
 
       try {
-        // Gunakan 10.0.2.2 jika di Android Emulator, atau localhost jika di Web/Desktop
         final response = await http.post(
-          Uri.parse('https://shelter.cbinstrument.com/login'),
+          AppConfig.login(),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({
             'username': _usernameController.text,
@@ -48,14 +48,47 @@ class _LoginPageState extends State<LoginPage> {
           final data = jsonDecode(response.body);
           final prefs = await SharedPreferences.getInstance();
           await prefs.setString('username', _usernameController.text);
+          if (data['role'] != null) {
+            await prefs.setString('user_role', data['role'].toString());
+          }
           if (data['tenant_id'] != null) {
             await prefs.setString('tenant_id', data['tenant_id'].toString());
           }
+          if (data['foto_profile'] != null) {
+            await prefs.setString(
+              'profile_image_server_${_usernameController.text}',
+              data['foto_profile'].toString(),
+            );
+          }
           if (data['shelters'] != null) {
+            final List<dynamic> shelterList = data['shelters'];
             await prefs.setString(
               'available_shelters',
-              jsonEncode(data['shelters']),
+              jsonEncode(shelterList),
             );
+            if (shelterList.isNotEmpty) {
+              final firstShelter = shelterList[0];
+              final firstShelterId = firstShelter['id']?.toString() ?? 'SHELTER-01';
+              await prefs.setString('current_shelter_id', firstShelterId);
+              if (firstShelter['latitude'] != null) {
+                await prefs.setDouble(
+                  'shelter_lat',
+                  (firstShelter['latitude'] as num).toDouble(),
+                );
+              }
+              if (firstShelter['longitude'] != null) {
+                await prefs.setDouble(
+                  'shelter_lng',
+                  (firstShelter['longitude'] as num).toDouble(),
+                );
+              }
+              if (firstShelter['geofence_radius'] != null) {
+                await prefs.setDouble(
+                  'shelter_radius_m',
+                  (firstShelter['geofence_radius'] as num).toDouble(),
+                );
+              }
+            }
           }
           
           if (!mounted) return;

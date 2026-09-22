@@ -2,17 +2,19 @@ import 'package:flutter/material.dart';
 
 import 'dart:async';
 import 'dart:ui';
+import 'dart:io';
 
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:fl_chart/fl_chart.dart';
+import 'package:image_picker/image_picker.dart';
 
 import 'dart:convert';
 
-import 'package:mqtt_client/mqtt_client.dart';
-import 'package:mqtt_client/mqtt_server_client.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:http/http.dart' as http;
 import 'package:geolocator/geolocator.dart';
 
+import 'config.dart';
 import 'login_page.dart';
 
 class SensorsPage extends StatefulWidget {
@@ -347,7 +349,8 @@ class DashboardTab extends StatefulWidget {
 }
 
 class _DashboardTabState extends State<DashboardTab> {
-  MqttServerClient? client;
+  WebSocketChannel? channel;
+  StreamSubscription? _wsSub;
 
   // Multi-Tenant / Multi-Shelter state
   String currentShelterId = 'SHELTER-01';
@@ -386,6 +389,7 @@ class _DashboardTabState extends State<DashboardTab> {
   // State untuk Line Chart
   List<FlSpot> historySpots = [];
   List<String> historyTimeLabels = [];
+  List<String> historyFullDateLabels = [];
   bool isLoadingHistory = true;
 
   SensorMeta get selectedSensor {
@@ -406,9 +410,8 @@ class _DashboardTabState extends State<DashboardTab> {
   void initState() {
     super.initState();
     _loadSensors();
-    _loadShelters();
     _loadAppCustomization();
-    _connectMqtt();
+    _loadShelters();
   }
 
   Future<void> _loadShelters() async {
@@ -430,11 +433,30 @@ class _DashboardTabState extends State<DashboardTab> {
       }
     }
 
-    if (savedShelterId != null && mounted) {
+    String activeId = currentShelterId;
+    if (savedShelterId != null &&
+        availableShelters.any((s) => s.id == savedShelterId)) {
+      activeId = savedShelterId;
+    } else if (availableShelters.isNotEmpty) {
+      activeId = availableShelters.first.id;
+      await prefs.setString('current_shelter_id', activeId);
+    }
+
+    final activeShelter = availableShelters.firstWhere(
+      (s) => s.id == activeId,
+      orElse: () => ShelterData(id: activeId, name: activeId),
+    );
+
+    if (mounted) {
       setState(() {
-        currentShelterId = savedShelterId;
+        currentShelterId = activeId;
+        appTitle = activeShelter.name;
       });
     }
+
+    // Sambungkan WebSocket & fetch history sesuai shelter yang telah terpilih
+    _connectWebSocket();
+    _fetchHistory(selectedSensor.key);
 
     _fetchSheltersFromApi();
   }
@@ -443,21 +465,30 @@ class _DashboardTabState extends State<DashboardTab> {
     try {
       final prefs = await SharedPreferences.getInstance();
       final tenantId = prefs.getString('tenant_id');
-      final url = tenantId != null && tenantId.isNotEmpty
-          ? 'https://shelter.cbinstrument.com/shelters?tenant_id=$tenantId'
-          : 'https://shelter.cbinstrument.com/shelters';
 
-      final response =
-          await http.get(Uri.parse(url)).timeout(const Duration(seconds: 5));
+      final response = await http
+          .get(AppConfig.shelters(tenantId: tenantId))
+          .timeout(const Duration(seconds: 5));
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
         final List<dynamic> list = data['shelters'] ?? [];
         if (list.isNotEmpty && mounted) {
           final loaded = list.map((e) => ShelterData.fromJson(e)).toList();
+          final activeShelter = loaded.firstWhere(
+            (s) => s.id == currentShelterId,
+            orElse: () => loaded.first,
+          );
+
           setState(() {
             availableShelters = loaded;
+            appTitle = activeShelter.name;
           });
           await prefs.setString('available_shelters', jsonEncode(list));
+
+          // Jika shelter saat ini tidak ada di daftar tenant user, otomatis beralih ke shelter pertama milik tenant
+          if (!loaded.any((s) => s.id == currentShelterId)) {
+            _changeShelter(loaded.first.id);
+          }
         }
       }
     } catch (_) {}
@@ -466,15 +497,11 @@ class _DashboardTabState extends State<DashboardTab> {
   Future<void> _changeShelter(String newShelterId) async {
     if (newShelterId == currentShelterId) return;
 
-    final oldShelterId = currentShelterId;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('current_shelter_id', newShelterId);
 
-    // Unsubscribe shelter lama, subscribe shelter baru di MQTT
-    if (client?.connectionStatus?.state == MqttConnectionState.connected) {
-      client?.unsubscribe('shelter/$oldShelterId/sensors');
-      client?.subscribe('shelter/$newShelterId/sensors', MqttQos.atLeastOnce);
-    }
+    // Putuskan WebSocket lama; akan tersambung ulang ke shelter baru
+    _disconnectWebSocket();
 
     // Cari koordinat shelter baru untuk update geofence otomatis
     final newShelter = availableShelters.firstWhere(
@@ -490,8 +517,10 @@ class _DashboardTabState extends State<DashboardTab> {
     if (mounted) {
       setState(() {
         currentShelterId = newShelterId;
+        appTitle = newShelter.name;
         sensorValues = {};
       });
+      _connectWebSocket();
       _fetchHistory(selectedSensor.key);
     }
   }
@@ -500,7 +529,6 @@ class _DashboardTabState extends State<DashboardTab> {
     final prefs = await SharedPreferences.getInstance();
     if (mounted) {
       setState(() {
-        appTitle = prefs.getString('app_title') ?? 'Sensor Dashboard';
         appSubtitle =
             prefs.getString('app_subtitle') ??
             'Live metrics from your smart shelter';
@@ -512,11 +540,78 @@ class _DashboardTabState extends State<DashboardTab> {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('app_title', title);
     await prefs.setString('app_subtitle', subtitle);
+
+    // Update nama shelter pada list shelter lokal
+    final idx = availableShelters.indexWhere((s) => s.id == currentShelterId);
+    if (idx != -1) {
+      final old = availableShelters[idx];
+      availableShelters[idx] = ShelterData(
+        id: old.id,
+        name: title,
+        latitude: old.latitude,
+        longitude: old.longitude,
+        geofenceRadius: old.geofenceRadius,
+      );
+      await prefs.setString(
+        'available_shelters',
+        jsonEncode(availableShelters.map((s) => s.toJson()).toList()),
+      );
+    }
+
     if (mounted) {
       setState(() {
         appTitle = title;
         appSubtitle = subtitle;
       });
+    }
+
+    // Kirim HTTP PUT untuk update nama shelter ke database server MariaDB
+    try {
+      final response = await http
+          .put(
+            AppConfig.updateShelter(currentShelterId),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'name': title,
+            }),
+          )
+          .timeout(const Duration(seconds: 8));
+
+      if (response.statusCode == 200 && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Nama shelter berhasil diperbarui di database!',
+            ),
+            backgroundColor: Color(0xFF00C853),
+            behavior: SnackBarBehavior.floating,
+            duration: Duration(seconds: 2),
+          ),
+        );
+      } else if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Gagal update database (HTTP ${response.statusCode}). Pastikan backend di server sudah di-build & restart.',
+            ),
+            backgroundColor: Colors.redAccent,
+            behavior: SnackBarBehavior.floating,
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      }
+    } catch (e) {
+      debugPrint('Error updating shelter name to database: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Gagal koneksi ke server: $e'),
+            backgroundColor: Colors.redAccent,
+            behavior: SnackBarBehavior.floating,
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      }
     }
   }
 
@@ -579,9 +674,7 @@ class _DashboardTabState extends State<DashboardTab> {
     setState(() => isLoadingHistory = true);
     try {
       final response = await http.get(
-        Uri.parse(
-          'https://shelter.cbinstrument.com/sensor/history/$sensorType?shelter_id=$currentShelterId&limit=24',
-        ),
+        AppConfig.sensorHistory(sensorType, currentShelterId, limit: 24),
       );
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
@@ -589,6 +682,22 @@ class _DashboardTabState extends State<DashboardTab> {
 
         List<FlSpot> newSpots = [];
         List<String> newLabels = [];
+        List<String> newFullLabels = [];
+
+        final months = [
+          'Jan',
+          'Feb',
+          'Mar',
+          'Apr',
+          'Mei',
+          'Jun',
+          'Jul',
+          'Agu',
+          'Sep',
+          'Okt',
+          'Nov',
+          'Des',
+        ];
 
         for (int i = 0; i < history.length; i++) {
           final item = history[i];
@@ -596,21 +705,23 @@ class _DashboardTabState extends State<DashboardTab> {
           newSpots.add(FlSpot(i.toDouble(), val));
 
           String timeStr = '$i';
+          String fullDateStr = '$i';
           if (item['created_at'] != null) {
             final rawDate = item['created_at'].toString().trim();
             try {
-              // Server MySQL menyimpan waktu dalam UTC.
-              // Tambahkan marker 'Z' (UTC) lalu konversi ke waktu lokal HP (.toLocal() -> WIB/WITA/WIT).
+              // Server MySQL menyimpan waktu dalam UTC atau WIB.
               DateTime dt;
               if (rawDate.endsWith('Z') || rawDate.contains('+')) {
                 dt = DateTime.parse(rawDate).toLocal();
               } else {
-                final isoStr = '${rawDate.replaceAll(' ', 'T')}Z';
-                dt = DateTime.parse(isoStr).toLocal();
+                dt = DateTime.parse(rawDate.replaceAll(' ', 'T'));
               }
+              final day = dt.day.toString().padLeft(2, '0');
+              final monthStr = months[(dt.month - 1).clamp(0, 11)];
               final hour = dt.hour.toString().padLeft(2, '0');
               final minute = dt.minute.toString().padLeft(2, '0');
               timeStr = '$hour:$minute';
+              fullDateStr = '$day $monthStr $hour:$minute';
             } catch (e) {
               if (rawDate.contains('T')) {
                 timeStr = rawDate.split('T')[1].substring(0, 5);
@@ -619,15 +730,18 @@ class _DashboardTabState extends State<DashboardTab> {
               } else {
                 timeStr = rawDate;
               }
+              fullDateStr = timeStr;
             }
           }
           newLabels.add(timeStr);
+          newFullLabels.add(fullDateStr);
         }
 
         if (mounted) {
           setState(() {
             historySpots = newSpots;
             historyTimeLabels = newLabels;
+            historyFullDateLabels = newFullLabels;
             isLoadingHistory = false;
           });
         }
@@ -640,70 +754,67 @@ class _DashboardTabState extends State<DashboardTab> {
     }
   }
 
-  Future<void> _connectMqtt() async {
-    client = MqttServerClient(
-      'shelter.cbinstrument.com',
-      'flutter_client_${DateTime.now().millisecondsSinceEpoch}',
-    );
-    client!.port = 1883;
-    client!.logging(on: false);
-    client!.keepAlivePeriod = 60;
-
-    final connMess = MqttConnectMessage()
-        .withClientIdentifier(
-          'flutter_client_${DateTime.now().millisecondsSinceEpoch}',
-        )
-        .startClean();
-    client!.connectionMessage = connMess;
-
+  Future<void> _connectWebSocket() async {
+    _disconnectWebSocket();
+    if (channel != null) return;
     try {
-      await client!.connect();
-    } catch (e) {
-      print('MQTT Connect Exception: $e');
-      client!.disconnect();
-      return;
-    }
+      channel = WebSocketChannel.connect(AppConfig.wsSensors(currentShelterId));
+      await channel!.ready;
 
-    if (client!.connectionStatus!.state == MqttConnectionState.connected) {
-      print('MQTT client connected');
-      client!.subscribe('shelter/$currentShelterId/sensors', MqttQos.atLeastOnce);
-
-      client!.updates!.listen((List<MqttReceivedMessage<MqttMessage>> c) {
-        final MqttPublishMessage recMess = c[0].payload as MqttPublishMessage;
-        final String pt = MqttPublishPayload.bytesToStringAsString(
-          recMess.payload.message,
-        );
-
-        try {
-          final data = jsonDecode(pt);
-          if (data is Map<String, dynamic> && mounted) {
-            setState(() {
-              data.forEach((k, v) {
-                sensorValues[k] = v.toString();
+      _wsSub = channel!.stream.listen(
+        (message) {
+          try {
+            final decoded = jsonDecode(message.toString());
+            if (decoded is Map<String, dynamic> &&
+                decoded['type'] == 'sensor' &&
+                decoded['data'] is Map &&
+                mounted) {
+              final data = decoded['data'] as Map;
+              setState(() {
+                data.forEach((k, v) {
+                  sensorValues[k.toString()] = v.toString();
+                });
               });
-            });
+            }
+          } catch (e) {
+            print('WS Parse Error: $e');
           }
-        } catch (e) {
-          print('JSON Parse Error: $e');
-        }
-      });
-    } else {
-      print('ERROR MQTT connection failed');
-      client!.disconnect();
+        },
+        onDone: () {
+          _wsSub = null;
+          channel = null;
+          // Sambung ulang otomatis setelah 3 detik
+          Future.delayed(const Duration(seconds: 3), () {
+            if (mounted) _connectWebSocket();
+          });
+        },
+        onError: (e) {
+          print('WS Error: $e');
+        },
+      );
+    } catch (e) {
+      print('WS Connect Exception: $e');
+      channel = null;
     }
   }
 
+  void _disconnectWebSocket() {
+    _wsSub?.cancel();
+    _wsSub = null;
+    try {
+      channel?.sink.close();
+    } catch (_) {}
+    channel = null;
+  }
+
   void _publishCommand(String device, bool isOn) {
-    if (client?.connectionStatus?.state == MqttConnectionState.connected) {
-      final builder = MqttClientPayloadBuilder();
-      final commandName = '${isOn ? "on" : "off"}_${device.toLowerCase()}';
-      final jsonPayload = jsonEncode({"command": commandName});
-      builder.addString(jsonPayload);
-      client!.publishMessage(
-        'shelter/$currentShelterId/command',
-        MqttQos.atLeastOnce,
-        builder.payload!,
-      );
+    if (channel == null) return;
+    final commandName = '${isOn ? "on" : "off"}_${device.toLowerCase()}';
+    final payload = jsonEncode({"type": "command", "command": commandName});
+    try {
+      channel!.sink.add(payload);
+    } catch (e) {
+      print('WS publish error: $e');
     }
   }
 
@@ -828,10 +939,18 @@ class _DashboardTabState extends State<DashboardTab> {
       orElse: () => ShelterData(id: currentShelterId, name: currentShelterId),
     );
 
+    // Hindari duplikasi jika nama shelter sudah mengandung ID
+    final displayName = activeShelter.name.contains(activeShelter.id)
+        ? activeShelter.name
+        : '${activeShelter.name} (${activeShelter.id})';
+
+    final hasMultipleShelters = availableShelters.length > 1;
+
     return InkWell(
-      onTap: _showShelterSelectorModal,
+      onTap: hasMultipleShelters ? _showShelterSelectorModal : null,
       borderRadius: BorderRadius.circular(20),
       child: Container(
+        constraints: const BoxConstraints(maxWidth: 240),
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
         decoration: BoxDecoration(
           color: const Color(0xFF00E5FF).withValues(alpha: 0.15),
@@ -850,20 +969,26 @@ class _DashboardTabState extends State<DashboardTab> {
               color: Color(0xFF00E5FF),
             ),
             const SizedBox(width: 6),
-            Text(
-              '${activeShelter.name} (${activeShelter.id})',
-              style: const TextStyle(
-                color: Colors.white,
-                fontSize: 12,
-                fontWeight: FontWeight.w600,
+            Flexible(
+              child: Text(
+                displayName,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                ),
               ),
             ),
-            const SizedBox(width: 4),
-            const Icon(
-              Icons.arrow_drop_down_rounded,
-              size: 18,
-              color: Colors.white70,
-            ),
+            if (hasMultipleShelters) ...[
+              const SizedBox(width: 4),
+              const Icon(
+                Icons.arrow_drop_down_rounded,
+                size: 18,
+                color: Colors.white70,
+              ),
+            ],
           ],
         ),
       ),
@@ -871,6 +996,7 @@ class _DashboardTabState extends State<DashboardTab> {
   }
 
   void _showShelterSelectorModal() {
+    if (availableShelters.length <= 1) return;
     showModalBottomSheet(
       context: context,
       backgroundColor: Colors.transparent,
@@ -1329,7 +1455,7 @@ class _DashboardTabState extends State<DashboardTab> {
 
   @override
   void dispose() {
-    client?.disconnect();
+    _disconnectWebSocket();
     super.dispose();
   }
 
@@ -1558,13 +1684,40 @@ class _DashboardTabState extends State<DashboardTab> {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text(
-                '${selectedSensor.title} History',
-                style: const TextStyle(
-                  fontSize: 20,
-                  fontWeight: FontWeight.bold,
-                  color: Colors.white,
-                ),
+              Row(
+                children: [
+                  Text(
+                    '${selectedSensor.title} History',
+                    style: const TextStyle(
+                      fontSize: 20,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.white,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 3,
+                    ),
+                    decoration: BoxDecoration(
+                      color: selectedSensor.color.withValues(alpha: 0.2),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(
+                        color: selectedSensor.color.withValues(alpha: 0.5),
+                        width: 1,
+                      ),
+                    ),
+                    child: Text(
+                      selectedSensor.unit,
+                      style: TextStyle(
+                        color: selectedSensor.color,
+                        fontSize: 11,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+                ],
               ),
               IconButton(
                 icon: const Icon(Icons.refresh_rounded, color: Colors.white70),
@@ -1573,7 +1726,7 @@ class _DashboardTabState extends State<DashboardTab> {
               ),
             ],
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: 10),
           SingleChildScrollView(
             scrollDirection: Axis.horizontal,
             child: Row(
@@ -1582,50 +1735,76 @@ class _DashboardTabState extends State<DashboardTab> {
                 final active = _selectedSensorKey == s.key;
                 return Padding(
                   padding: const EdgeInsets.only(right: 8.0),
-                  child: FilterChip(
-                    avatar: Icon(
-                      s.icon,
-                      size: 16,
-                      color: active ? Colors.black87 : s.color,
-                    ),
-                    label: Text(s.title),
-                    labelStyle: TextStyle(
-                      color: active ? Colors.black87 : Colors.white,
-                      fontWeight: active ? FontWeight.bold : FontWeight.normal,
-                      fontSize: 12,
-                    ),
-                    selected: active,
-                    selectedColor: s.color,
-                    backgroundColor: Colors.white.withValues(alpha: 0.12),
-                    side: BorderSide(
-                      color: active
-                          ? s.color
-                          : Colors.white.withValues(alpha: 0.2),
-                    ),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(20),
-                    ),
-                    onSelected: (val) {
-                      if (val) {
-                        setState(() => _selectedSensorKey = s.key);
-                        _fetchHistory(s.key);
-                      }
+                  child: InkWell(
+                    onTap: () {
+                      setState(() => _selectedSensorKey = s.key);
+                      _fetchHistory(s.key);
                     },
+                    borderRadius: BorderRadius.circular(20),
+                    child: AnimatedContainer(
+                      duration: const Duration(milliseconds: 200),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 8,
+                      ),
+                      decoration: BoxDecoration(
+                        color: active
+                            ? s.color
+                            : const Color(0xFF152238).withValues(alpha: 0.9),
+                        borderRadius: BorderRadius.circular(20),
+                        border: Border.all(
+                          color: active
+                              ? s.color
+                              : Colors.white.withValues(alpha: 0.25),
+                          width: 1.2,
+                        ),
+                        boxShadow: active
+                            ? [
+                                BoxShadow(
+                                  color: s.color.withValues(alpha: 0.35),
+                                  blurRadius: 8,
+                                  offset: const Offset(0, 2),
+                                ),
+                              ]
+                            : null,
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            s.icon,
+                            size: 16,
+                            color: active ? Colors.black87 : s.color,
+                          ),
+                          const SizedBox(width: 6),
+                          Text(
+                            s.title,
+                            style: TextStyle(
+                              color: active ? Colors.black87 : Colors.white,
+                              fontWeight: active
+                                  ? FontWeight.bold
+                                  : FontWeight.w600,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
                   ),
                 );
               }),
             ),
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 14),
           ClipRRect(
             borderRadius: BorderRadius.circular(20),
             child: BackdropFilter(
               filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
               child: Container(
-                height: 250,
-                padding: const EdgeInsets.all(16),
+                height: 270,
+                padding: const EdgeInsets.fromLTRB(6, 18, 18, 12),
                 decoration: BoxDecoration(
-                  color: Colors.white.withValues(alpha: 0.15),
+                  color: Colors.white.withValues(alpha: 0.12),
                   borderRadius: BorderRadius.circular(20),
                   border: Border.all(
                     color: Colors.white.withValues(alpha: 0.2),
@@ -1649,6 +1828,7 @@ class _DashboardTabState extends State<DashboardTab> {
                         builder: (context) {
                           double? computedMinY;
                           double? computedMaxY;
+                          double intervalY = 1.0;
                           if (historySpots.isNotEmpty) {
                             final yValues = historySpots
                                 .map((s) => s.y)
@@ -1668,16 +1848,66 @@ class _DashboardTabState extends State<DashboardTab> {
                               double.infinity,
                             );
                             computedMaxY = maxYVal + padding;
+                            final span = computedMaxY - computedMinY;
+                            intervalY = span > 0 ? (span / 4) : 1.0;
                           }
 
                           return LineChart(
                             LineChartData(
                               minY: computedMinY,
                               maxY: computedMaxY,
-                              gridData: const FlGridData(show: false),
+                              gridData: FlGridData(
+                                show: true,
+                                drawVerticalLine: false,
+                                drawHorizontalLine: true,
+                                horizontalInterval: intervalY > 0
+                                    ? intervalY
+                                    : null,
+                                getDrawingHorizontalLine: (value) => FlLine(
+                                  color: Colors.white.withValues(alpha: 0.1),
+                                  strokeWidth: 1,
+                                  dashArray: [4, 4],
+                                ),
+                              ),
                               titlesData: FlTitlesData(
-                                leftTitles: const AxisTitles(
-                                  sideTitles: SideTitles(showTitles: false),
+                                leftTitles: AxisTitles(
+                                  sideTitles: SideTitles(
+                                    showTitles: true,
+                                    reservedSize: 38,
+                                    interval: intervalY > 0 ? intervalY : null,
+                                    getTitlesWidget: (value, meta) {
+                                      if (computedMinY != null &&
+                                          value < (computedMinY - 0.001)) {
+                                        return const SizedBox.shrink();
+                                      }
+                                      if (computedMaxY != null &&
+                                          value > (computedMaxY + 0.001)) {
+                                        return const SizedBox.shrink();
+                                      }
+                                      String text;
+                                      if (value >= 100) {
+                                        text = value.toStringAsFixed(0);
+                                      } else if (value >= 10) {
+                                        text = value.toStringAsFixed(0);
+                                      } else {
+                                        text = value.toStringAsFixed(1);
+                                      }
+                                      return Padding(
+                                        padding: const EdgeInsets.only(
+                                          right: 6.0,
+                                        ),
+                                        child: Text(
+                                          text,
+                                          textAlign: TextAlign.right,
+                                          style: const TextStyle(
+                                            color: Colors.white60,
+                                            fontSize: 10,
+                                            fontWeight: FontWeight.w500,
+                                          ),
+                                        ),
+                                      );
+                                    },
+                                  ),
                                 ),
                                 topTitles: const AxisTitles(
                                   sideTitles: SideTitles(showTitles: false),
@@ -1688,7 +1918,7 @@ class _DashboardTabState extends State<DashboardTab> {
                                 bottomTitles: AxisTitles(
                                   sideTitles: SideTitles(
                                     showTitles: true,
-                                    reservedSize: 24,
+                                    reservedSize: 26,
                                     getTitlesWidget: (value, meta) {
                                       int index = value.toInt();
                                       if (index >= 0 &&
@@ -1709,6 +1939,7 @@ class _DashboardTabState extends State<DashboardTab> {
                                               style: const TextStyle(
                                                 color: Colors.white70,
                                                 fontSize: 10,
+                                                fontWeight: FontWeight.w500,
                                               ),
                                             ),
                                           );
@@ -1719,14 +1950,26 @@ class _DashboardTabState extends State<DashboardTab> {
                                   ),
                                 ),
                               ),
-                              borderData: FlBorderData(show: false),
+                              borderData: FlBorderData(
+                                show: true,
+                                border: Border(
+                                  bottom: BorderSide(
+                                    color: Colors.white.withValues(alpha: 0.15),
+                                    width: 1,
+                                  ),
+                                  left: BorderSide(
+                                    color: Colors.white.withValues(alpha: 0.15),
+                                    width: 1,
+                                  ),
+                                ),
+                              ),
                               lineTouchData: LineTouchData(
                                 handleBuiltInTouches: true,
                                 touchTooltipData: LineTouchTooltipData(
                                   fitInsideHorizontally: true,
                                   fitInsideVertically: true,
                                   getTooltipColor: (touchedSpot) =>
-                                      const Color(0xFF37474F)
+                                      const Color(0xFF0F172A)
                                           .withValues(alpha: 0.95),
                                   tooltipBorderRadius: BorderRadius.circular(
                                     10,
@@ -1738,13 +1981,22 @@ class _DashboardTabState extends State<DashboardTab> {
                                   getTooltipItems: (touchedSpots) {
                                     return touchedSpots.map((spot) {
                                       int idx = spot.x.toInt();
-                                      String time =
+                                      String dateTime =
                                           (idx >= 0 &&
-                                              idx < historyTimeLabels.length)
-                                          ? historyTimeLabels[idx]
-                                          : '';
+                                              idx <
+                                                  historyFullDateLabels.length)
+                                          ? historyFullDateLabels[idx]
+                                          : ((idx >= 0 &&
+                                                  idx <
+                                                      historyTimeLabels.length)
+                                              ? historyTimeLabels[idx]
+                                              : '');
+                                      String formattedVal =
+                                          spot.y >= 10
+                                              ? spot.y.toStringAsFixed(1)
+                                              : spot.y.toStringAsFixed(2);
                                       return LineTooltipItem(
-                                        '${spot.y} ${selectedSensor.unit}\n$time',
+                                        '$formattedVal ${selectedSensor.unit}\n$dateTime',
                                         const TextStyle(
                                           color: Colors.white,
                                           fontWeight: FontWeight.bold,
@@ -1760,14 +2012,39 @@ class _DashboardTabState extends State<DashboardTab> {
                                 LineChartBarData(
                                   spots: historySpots,
                                   isCurved: true,
+                                  curveSmoothness: 0.35,
                                   color: selectedSensor.color,
-                                  barWidth: 4,
+                                  barWidth: 3.5,
                                   isStrokeCapRound: true,
-                                  dotData: const FlDotData(show: false),
+                                  dotData: FlDotData(
+                                    show: historySpots.length <= 25,
+                                    getDotPainter: (
+                                      spot,
+                                      percent,
+                                      barData,
+                                      index,
+                                    ) {
+                                      return FlDotCirclePainter(
+                                        radius: 3.5,
+                                        color: selectedSensor.color,
+                                        strokeWidth: 1.5,
+                                        strokeColor: Colors.white,
+                                      );
+                                    },
+                                  ),
                                   belowBarData: BarAreaData(
                                     show: true,
-                                    color: selectedSensor.color.withValues(
-                                      alpha: 0.3,
+                                    gradient: LinearGradient(
+                                      begin: Alignment.topCenter,
+                                      end: Alignment.bottomCenter,
+                                      colors: [
+                                        selectedSensor.color.withValues(
+                                          alpha: 0.35,
+                                        ),
+                                        selectedSensor.color.withValues(
+                                          alpha: 0.02,
+                                        ),
+                                      ],
                                     ),
                                   ),
                                 ),
@@ -2112,7 +2389,8 @@ class _LocationTabState extends State<LocationTab> {
   double shelterLng = 107.53343065982726;
   double thresholdMeters = 150.0; // default 150 meter
 
-  MqttServerClient? client;
+  WebSocketChannel? channel;
+  StreamSubscription? _wsSub;
   bool isConnected = false;
   StreamSubscription<Position>? _positionStreamSubscription;
 
@@ -2129,18 +2407,60 @@ class _LocationTabState extends State<LocationTab> {
     super.initState();
     _loadGeofenceSettings().then((_) {
       _startLiveGeofence();
+      _connectWebSocket();
     });
-    _connectMqtt();
   }
 
   Future<void> _loadGeofenceSettings() async {
     final prefs = await SharedPreferences.getInstance();
+    final activeId = prefs.getString('current_shelter_id') ?? 'SHELTER-01';
+
+    // 1. Tampilkan cache lokal terlebih dahulu agar UI instan
     setState(() {
-      currentShelterId = prefs.getString('current_shelter_id') ?? 'SHELTER-01';
-      shelterLat = prefs.getDouble('shelter_lat') ?? -6.951613312233824;
-      shelterLng = prefs.getDouble('shelter_lng') ?? 107.53343065982726;
-      thresholdMeters = prefs.getDouble('shelter_radius_m') ?? 150.0;
+      currentShelterId = activeId;
+      shelterLat = prefs.getDouble('shelter_lat') ?? -6.902400;
+      shelterLng = prefs.getDouble('shelter_lng') ?? 107.618700;
+      thresholdMeters = prefs.getDouble('shelter_radius_m') ?? 100.0;
     });
+
+    // 2. Ambil parameter TERBARU langsung dari database via API /shelters
+    try {
+      final tenantId = prefs.getString('tenant_id');
+      final response = await http
+          .get(AppConfig.shelters(tenantId: tenantId))
+          .timeout(const Duration(seconds: 5));
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        final List<dynamic> shelters = data['shelters'] ?? [];
+        final currentShelter = shelters.firstWhere(
+          (s) => s['id'] == activeId,
+          orElse: () => shelters.isNotEmpty ? shelters[0] : null,
+        );
+
+        if (currentShelter != null && mounted) {
+          final dbLat = (currentShelter['latitude'] as num?)?.toDouble() ?? shelterLat;
+          final dbLng = (currentShelter['longitude'] as num?)?.toDouble() ?? shelterLng;
+          final dbRadius = (currentShelter['geofence_radius'] as num?)?.toDouble() ?? thresholdMeters;
+
+          setState(() {
+            shelterLat = dbLat;
+            shelterLng = dbLng;
+            thresholdMeters = dbRadius;
+          });
+
+          await prefs.setDouble('shelter_lat', dbLat);
+          await prefs.setDouble('shelter_lng', dbLng);
+          await prefs.setDouble('shelter_radius_m', dbRadius);
+
+          if (currentLat != null && currentLng != null) {
+            _evaluateLocation(currentLat!, currentLng!);
+          }
+        }
+      }
+    } catch (e) {
+      debugPrint('Info: Menggunakan cache lokal geofence (server unreached): $e');
+    }
   }
 
   Future<void> _saveGeofenceSettings(
@@ -2159,6 +2479,46 @@ class _LocationTabState extends State<LocationTab> {
     });
     if (currentLat != null && currentLng != null) {
       _evaluateLocation(currentLat!, currentLng!);
+    }
+
+    // Sinkronisasi permanen ke database MariaDB via HTTP PUT
+    try {
+      final response = await http
+          .put(
+            AppConfig.updateShelter(currentShelterId),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'latitude': lat,
+              'longitude': lng,
+              'geofence_radius': radiusM,
+            }),
+          )
+          .timeout(const Duration(seconds: 8));
+
+      if (response.statusCode == 200 && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Lokasi & radius shelter berhasil disimpan ke database!',
+            ),
+            backgroundColor: Color(0xFF00C853),
+            behavior: SnackBarBehavior.floating,
+            duration: Duration(seconds: 2),
+          ),
+        );
+      } else if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Tersimpan di HP, gagal sinkron database (Status: ${response.statusCode})',
+            ),
+            backgroundColor: Colors.orangeAccent,
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+    } catch (e) {
+      debugPrint('Error updating shelter to database: $e');
     }
   }
 
@@ -2365,46 +2725,49 @@ class _LocationTabState extends State<LocationTab> {
     );
   }
 
-  Future<void> _connectMqtt() async {
-    client = MqttServerClient(
-      'shelter.cbinstrument.com',
-      'flutter_door_${DateTime.now().millisecondsSinceEpoch}',
-    );
-    client!.port = 1883;
-    client!.logging(on: false);
-    client!.keepAlivePeriod = 60;
-
-    final connMess = MqttConnectMessage()
-        .withClientIdentifier(
-          'flutter_door_${DateTime.now().millisecondsSinceEpoch}',
-        )
-        .startClean();
-    client!.connectionMessage = connMess;
-
+  Future<void> _connectWebSocket() async {
+    _disconnectWebSocket();
+    if (channel != null) return;
     try {
-      await client!.connect();
-      if (mounted) {
-        setState(() {
-          isConnected =
-              client!.connectionStatus?.state == MqttConnectionState.connected;
-        });
-      }
+      channel = WebSocketChannel.connect(AppConfig.wsSensors(currentShelterId));
+      await channel!.ready;
+      if (mounted) setState(() => isConnected = true);
+      _wsSub = channel!.stream.listen(
+        (_) {},
+        onDone: () {
+          _wsSub = null;
+          channel = null;
+          if (mounted) setState(() => isConnected = false);
+        },
+        onError: (e) {
+          print('WS LocationTab error: $e');
+        },
+      );
     } catch (e) {
-      print('MQTT LocationTab connect error: $e');
+      print('WS LocationTab connect error: $e');
+      if (mounted) setState(() => isConnected = false);
+      channel = null;
     }
   }
 
+  void _disconnectWebSocket() {
+    _wsSub?.cancel();
+    _wsSub = null;
+    try {
+      channel?.sink.close();
+    } catch (_) {}
+    channel = null;
+    isConnected = false;
+  }
+
   void _publishCommand(String command) {
-    final payload = jsonEncode({'command': command});
-    if (client != null &&
-        client!.connectionStatus?.state == MqttConnectionState.connected) {
-      final builder = MqttClientPayloadBuilder();
-      builder.addString(payload);
-      client!.publishMessage(
-        'shelter/$currentShelterId/command',
-        MqttQos.atLeastOnce,
-        builder.payload!,
-      );
+    if (channel != null) {
+      final payload = jsonEncode({'type': 'command', 'command': command});
+      try {
+        channel!.sink.add(payload);
+      } catch (e) {
+        print('WS publish error: $e');
+      }
     }
     setState(() {
       lastCommandSent = command;
@@ -2542,7 +2905,7 @@ class _LocationTabState extends State<LocationTab> {
   @override
   void dispose() {
     _positionStreamSubscription?.cancel();
-    client?.disconnect();
+    _disconnectWebSocket();
     super.dispose();
   }
 
@@ -2647,7 +3010,7 @@ class _LocationTabState extends State<LocationTab> {
                     ),
                     const SizedBox(width: 6),
                     Text(
-                      isConnected ? 'MQTT Online' : 'Connecting...',
+                      isConnected ? 'WebSocket Online' : 'Connecting...',
                       style: TextStyle(
                         color: isConnected
                             ? Colors.greenAccent
@@ -2795,7 +3158,7 @@ class _LocationTabState extends State<LocationTab> {
 
                       Container(
                         padding: const EdgeInsets.symmetric(
-                          horizontal: 16,
+                          horizontal: 14,
                           vertical: 8,
                         ),
                         decoration: BoxDecoration(
@@ -2811,14 +3174,18 @@ class _LocationTabState extends State<LocationTab> {
                               color: Colors.white70,
                             ),
                             const SizedBox(width: 8),
-                            Text(
-                              currentDistanceKm != null
-                                  ? 'Jarak: ${(currentDistanceKm! >= 1.0 ? "${currentDistanceKm!.toStringAsFixed(2)} km" : "${(currentDistanceKm! * 1000).toStringAsFixed(0)} meter")} dari Shelter'
-                                  : 'Jarak: Belum terukur (Batas: $radiusLabel)',
-                              style: const TextStyle(
-                                fontSize: 13,
-                                fontWeight: FontWeight.bold,
-                                color: Colors.white,
+                            Flexible(
+                              child: Text(
+                                currentDistanceKm != null
+                                    ? 'Jarak: ${(currentDistanceKm! >= 1.0 ? "${currentDistanceKm!.toStringAsFixed(2)} km" : "${(currentDistanceKm! * 1000).toStringAsFixed(0)} meter")} dari Shelter'
+                                    : 'Jarak: Belum terukur (Batas: $radiusLabel)',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.bold,
+                                  color: Colors.white,
+                                ),
                               ),
                             ),
                           ],
@@ -2936,7 +3303,7 @@ class _LocationTabState extends State<LocationTab> {
                     if (lastCommandSent != null) ...[
                       const SizedBox(height: 6),
                       _buildInfoRow(
-                        'MQTT Command Terakhir:',
+                        'Command Terakhir:',
                         '{"command": "$lastCommandSent"}',
                         valColor: doorColor,
                       ),
@@ -3151,81 +3518,927 @@ class _LocationTabState extends State<LocationTab> {
 }
 
 // ---------------- PROFILE TAB ----------------
-class ProfileTab extends StatelessWidget {
+class ProfileTab extends StatefulWidget {
   final String username;
 
   const ProfileTab({super.key, required this.username});
 
   @override
-  Widget build(BuildContext context) {
-    return Center(
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(20),
-        child: BackdropFilter(
-          filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
-          child: Container(
-            width: 300,
-            padding: const EdgeInsets.all(32),
-            decoration: BoxDecoration(
-              color: Colors.white.withValues(alpha: 0.15),
-              borderRadius: BorderRadius.circular(20),
-              border: Border.all(color: Colors.white.withValues(alpha: 0.2)),
-            ),
+  State<ProfileTab> createState() => _ProfileTabState();
+}
+
+class _ProfileTabState extends State<ProfileTab> {
+  String _role = 'User';
+  String _tenantId = '-';
+  String _currentShelterId = 'SHELTER-01';
+  String? _profileImagePath;
+  String? _serverAvatarUrl;
+  bool _isUploadingAvatar = false;
+  List<ShelterData> _shelters = [];
+  bool _isLoading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadProfileData();
+  }
+
+  Future<void> _loadProfileData() async {
+    final prefs = await SharedPreferences.getInstance();
+    final savedRole = prefs.getString('user_role') ?? 'User';
+    final savedTenant = prefs.getString('tenant_id') ?? '-';
+    final savedShelterId =
+        prefs.getString('current_shelter_id') ?? 'SHELTER-01';
+    final savedImagePath =
+        prefs.getString('profile_image_${widget.username}');
+    final savedServerAvatar =
+        prefs.getString('profile_image_server_${widget.username}');
+
+    List<ShelterData> loadedShelters = [];
+    final savedSheltersJson = prefs.getString('available_shelters');
+    if (savedSheltersJson != null && savedSheltersJson.isNotEmpty) {
+      try {
+        final List<dynamic> decoded = jsonDecode(savedSheltersJson);
+        loadedShelters =
+            decoded.map((e) => ShelterData.fromJson(e)).toList();
+      } catch (e) {
+        debugPrint('Error parsing cached shelters in profile: $e');
+      }
+    }
+
+    if (mounted) {
+      setState(() {
+        _role = savedRole;
+        _tenantId = savedTenant;
+        _currentShelterId = savedShelterId;
+        _profileImagePath = savedImagePath;
+        _serverAvatarUrl = savedServerAvatar;
+        _shelters = loadedShelters;
+        _isLoading = false;
+      });
+    }
+
+    // Ambil data shelter paling fresh dari database server
+    _fetchFreshShelters(savedTenant);
+  }
+
+  Future<void> _fetchFreshShelters(String tenantId) async {
+    try {
+      final uri = AppConfig.shelters(
+        tenantId: (tenantId.isNotEmpty && tenantId != '-') ? tenantId : null,
+      );
+      final response =
+          await http.get(uri).timeout(const Duration(seconds: 6));
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        if (data['shelters'] != null) {
+          final List<dynamic> list = data['shelters'];
+          final updated =
+              list.map((e) => ShelterData.fromJson(e)).toList();
+          final prefs = await SharedPreferences.getInstance();
+          await prefs.setString('available_shelters', jsonEncode(list));
+          if (mounted) {
+            setState(() {
+              _shelters = updated;
+            });
+          }
+        }
+      }
+    } catch (e) {
+      debugPrint('Error fetching fresh shelters in profile: $e');
+    }
+  }
+
+  Future<void> _switchActiveShelter(ShelterData shelter) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('current_shelter_id', shelter.id);
+    if (shelter.latitude != null) {
+      await prefs.setDouble('shelter_lat', shelter.latitude!);
+    }
+    if (shelter.longitude != null) {
+      await prefs.setDouble('shelter_lng', shelter.longitude!);
+    }
+    await prefs.setDouble('shelter_radius_m', shelter.geofenceRadius);
+
+    if (mounted) {
+      setState(() {
+        _currentShelterId = shelter.id;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Shelter aktif diubah ke: ${shelter.name} (${shelter.id})',
+          ),
+          backgroundColor: const Color(0xFF00C853),
+          behavior: SnackBarBehavior.floating,
+          duration: const Duration(seconds: 2),
+        ),
+      );
+    }
+  }
+
+  Future<void> _pickImage(ImageSource source) async {
+    try {
+      final picker = ImagePicker();
+      final pickedFile = await picker.pickImage(
+        source: source,
+        maxWidth: 600,
+        maxHeight: 600,
+        imageQuality: 85,
+      );
+
+      if (pickedFile != null) {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setString(
+          'profile_image_${widget.username}',
+          pickedFile.path,
+        );
+
+        if (mounted) {
+          setState(() {
+            _profileImagePath = pickedFile.path;
+            _isUploadingAvatar = true;
+          });
+        }
+
+        // Upload ke database server MariaDB via backend API
+        try {
+          final req = http.MultipartRequest('POST', AppConfig.uploadAvatar());
+          req.fields['username'] = widget.username;
+          req.files.add(
+            await http.MultipartFile.fromPath('avatar', pickedFile.path),
+          );
+          final streamed =
+              await req.send().timeout(const Duration(seconds: 12));
+          final res = await http.Response.fromStream(streamed);
+
+          if (res.statusCode == 200) {
+            final body = jsonDecode(res.body);
+            if (body['foto_profile'] != null) {
+              final remoteUrl = body['foto_profile'].toString();
+              await prefs.setString(
+                'profile_image_server_${widget.username}',
+                remoteUrl,
+              );
+              if (mounted) {
+                setState(() {
+                  _serverAvatarUrl = remoteUrl;
+                });
+              }
+            }
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text(
+                    'Foto profil berhasil diperbarui & tersimpan di server!',
+                  ),
+                  backgroundColor: Color(0xFF00C853),
+                  behavior: SnackBarBehavior.floating,
+                  duration: Duration(seconds: 2),
+                ),
+              );
+            }
+          } else {
+            debugPrint('Server upload avatar status: ${res.statusCode}');
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text(
+                    'Foto tersimpan lokal (Upload server: HTTP ${res.statusCode})',
+                  ),
+                  backgroundColor: Colors.orangeAccent,
+                  behavior: SnackBarBehavior.floating,
+                ),
+              );
+            }
+          }
+        } catch (uploadErr) {
+          debugPrint('Upload avatar error: $uploadErr');
+        } finally {
+          if (mounted) {
+            setState(() {
+              _isUploadingAvatar = false;
+            });
+          }
+        }
+      }
+    } catch (e) {
+      debugPrint('Error picking profile image: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Gagal memilih foto: $e'),
+            backgroundColor: Colors.redAccent,
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+    }
+  }
+
+  Future<void> _removeProfileImage() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('profile_image_${widget.username}');
+    await prefs.remove('profile_image_server_${widget.username}');
+
+    if (mounted) {
+      setState(() {
+        _profileImagePath = null;
+        _serverAvatarUrl = null;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Foto profil dikembalikan ke default.'),
+          backgroundColor: Colors.orangeAccent,
+          behavior: SnackBarBehavior.floating,
+          duration: Duration(seconds: 2),
+        ),
+      );
+    }
+
+    // Hapus di server database
+    try {
+      await http
+          .delete(AppConfig.deleteAvatar(widget.username))
+          .timeout(const Duration(seconds: 6));
+    } catch (e) {
+      debugPrint('Delete avatar from server error: $e');
+    }
+  }
+
+  void _showImageSourceActionSheet(BuildContext context) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF1E293B),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (BuildContext ctx) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 16),
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                const CircleAvatar(
-                  radius: 50,
-                  backgroundColor: Colors.white24,
-                  child: Icon(Icons.person, size: 60, color: Colors.white),
+                Container(
+                  width: 40,
+                  height: 4,
+                  margin: const EdgeInsets.only(bottom: 20),
+                  decoration: BoxDecoration(
+                    color: Colors.white30,
+                    borderRadius: BorderRadius.circular(2),
+                  ),
                 ),
-                const SizedBox(height: 24),
-                Text(
-                  username,
-                  style: const TextStyle(
-                    fontSize: 28,
+                const Text(
+                  'Ganti Foto Profil',
+                  style: TextStyle(
+                    fontSize: 18,
                     fontWeight: FontWeight.bold,
                     color: Colors.white,
                   ),
                 ),
-                const SizedBox(height: 8),
-                const Text(
-                  'Administrator',
-                  style: TextStyle(fontSize: 16, color: Colors.white70),
-                ),
-                const SizedBox(height: 24),
-                ElevatedButton.icon(
-                  onPressed: () async {
-                    final prefs = await SharedPreferences.getInstance();
-                    await prefs.remove('username');
-
-                    if (!context.mounted) return;
-                    Navigator.pushReplacement(
-                      context,
-                      MaterialPageRoute(
-                        builder: (context) => const LoginPage(),
-                      ),
-                    );
-                  },
-                  icon: const Icon(Icons.logout),
-                  label: const Text('Logout'),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.redAccent,
-                    foregroundColor: Colors.white,
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(12),
+                const SizedBox(height: 16),
+                ListTile(
+                  leading: Container(
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      color: Colors.cyanAccent.withValues(alpha: 0.15),
+                      shape: BoxShape.circle,
                     ),
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 24,
-                      vertical: 12,
+                    child: const Icon(
+                      Icons.photo_library_rounded,
+                      color: Colors.cyanAccent,
                     ),
                   ),
+                  title: const Text(
+                    'Pilih dari Galeri',
+                    style: TextStyle(color: Colors.white),
+                  ),
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    _pickImage(ImageSource.gallery);
+                  },
                 ),
+                ListTile(
+                  leading: Container(
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      color: Colors.cyanAccent.withValues(alpha: 0.15),
+                      shape: BoxShape.circle,
+                    ),
+                    child: const Icon(
+                      Icons.camera_alt_rounded,
+                      color: Colors.cyanAccent,
+                    ),
+                  ),
+                  title: const Text(
+                    'Ambil Foto (Kamera)',
+                    style: TextStyle(color: Colors.white),
+                  ),
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    _pickImage(ImageSource.camera);
+                  },
+                ),
+                if (_profileImagePath != null)
+                  ListTile(
+                    leading: Container(
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: Colors.redAccent.withValues(alpha: 0.15),
+                        shape: BoxShape.circle,
+                      ),
+                      child: const Icon(
+                        Icons.delete_outline_rounded,
+                        color: Colors.redAccent,
+                      ),
+                    ),
+                    title: const Text(
+                      'Hapus Foto Profil',
+                      style: TextStyle(color: Colors.redAccent),
+                    ),
+                    onTap: () {
+                      Navigator.pop(ctx);
+                      _removeProfileImage();
+                    },
+                  ),
               ],
             ),
           ),
+        );
+      },
+    );
+  }
+
+  void _confirmLogout() {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1E293B),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: const Row(
+          children: [
+            Icon(Icons.logout_rounded, color: Colors.redAccent),
+            SizedBox(width: 10),
+            Text(
+              'Konfirmasi Logout',
+              style: TextStyle(color: Colors.white, fontSize: 18),
+            ),
+          ],
+        ),
+        content: Text(
+          'Apakah Anda yakin ingin keluar dari akun "${widget.username}"?',
+          style: const TextStyle(color: Colors.white70),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Batal', style: TextStyle(color: Colors.white60)),
+          ),
+          ElevatedButton(
+            onPressed: () async {
+              Navigator.pop(ctx);
+              final prefs = await SharedPreferences.getInstance();
+              await prefs.remove('username');
+
+              if (!mounted) return;
+              Navigator.pushReplacement(
+                context,
+                MaterialPageRoute(
+                  builder: (context) => const LoginPage(),
+                ),
+              );
+            },
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.redAccent,
+              foregroundColor: Colors.white,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(10),
+              ),
+            ),
+            child: const Text('Ya, Logout'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final displayRole = _role.isNotEmpty
+        ? (_role.toLowerCase() == 'admin'
+            ? 'Administrator'
+            : _role[0].toUpperCase() + _role.substring(1))
+        : 'User';
+
+    return SafeArea(
+      child: SingleChildScrollView(
+        physics: const BouncingScrollPhysics(),
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 20),
+        child: Column(
+          children: [
+            // --- KARTU PROFIL UTAMA (Glassmorphic) ---
+            ClipRRect(
+              borderRadius: BorderRadius.circular(24),
+              child: BackdropFilter(
+                filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+                child: Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 24,
+                    vertical: 28,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.12),
+                    borderRadius: BorderRadius.circular(24),
+                    border: Border.all(
+                      color: Colors.white.withValues(alpha: 0.2),
+                    ),
+                  ),
+                  child: Column(
+                    children: [
+                      // Avatar dengan tombol kamera
+                      Stack(
+                        alignment: Alignment.bottomRight,
+                        children: [
+                          GestureDetector(
+                            onTap: () => _showImageSourceActionSheet(context),
+                            child: Container(
+                              width: 108,
+                              height: 108,
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                border: Border.all(
+                                  color: Colors.cyanAccent.withValues(alpha: 0.6),
+                                  width: 2.5,
+                                ),
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: Colors.cyanAccent.withValues(alpha: 0.25),
+                                    blurRadius: 16,
+                                    spreadRadius: 2,
+                                  ),
+                                ],
+                              ),
+                              child: ClipOval(
+                                child: Stack(
+                                  alignment: Alignment.center,
+                                  children: [
+                                    if (_profileImagePath != null &&
+                                        File(_profileImagePath!).existsSync())
+                                      Image.file(
+                                        File(_profileImagePath!),
+                                        width: 108,
+                                        height: 108,
+                                        fit: BoxFit.cover,
+                                      )
+                                    else if (_serverAvatarUrl != null &&
+                                        _serverAvatarUrl!.isNotEmpty)
+                                      Image.network(
+                                        AppConfig.avatarUrl(_serverAvatarUrl!),
+                                        width: 108,
+                                        height: 108,
+                                        fit: BoxFit.cover,
+                                        errorBuilder:
+                                            (context, error, stackTrace) =>
+                                                Container(
+                                          decoration: const BoxDecoration(
+                                            gradient: LinearGradient(
+                                              colors: [
+                                                Color(0xFF0072FF),
+                                                Color(0xFF00C6FF),
+                                              ],
+                                              begin: Alignment.topLeft,
+                                              end: Alignment.bottomRight,
+                                            ),
+                                          ),
+                                          child: const Icon(
+                                            Icons.person_rounded,
+                                            size: 60,
+                                            color: Colors.white,
+                                          ),
+                                        ),
+                                      )
+                                    else
+                                      Container(
+                                        decoration: const BoxDecoration(
+                                          gradient: LinearGradient(
+                                            colors: [
+                                              Color(0xFF0072FF),
+                                              Color(0xFF00C6FF),
+                                            ],
+                                            begin: Alignment.topLeft,
+                                            end: Alignment.bottomRight,
+                                          ),
+                                        ),
+                                        child: const Icon(
+                                          Icons.person_rounded,
+                                          size: 60,
+                                          color: Colors.white,
+                                        ),
+                                      ),
+                                    if (_isUploadingAvatar)
+                                      Container(
+                                        color: Colors.black45,
+                                        child: const Center(
+                                          child: SizedBox(
+                                            width: 28,
+                                            height: 28,
+                                            child: CircularProgressIndicator(
+                                              color: Colors.cyanAccent,
+                                              strokeWidth: 2.5,
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                          // Badge Camera Button
+                          GestureDetector(
+                            onTap: () => _showImageSourceActionSheet(context),
+                            child: Container(
+                              padding: const EdgeInsets.all(7),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFF00E5FF),
+                                shape: BoxShape.circle,
+                                border: Border.all(
+                                  color: const Color(0xFF0F172A),
+                                  width: 2,
+                                ),
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: Colors.black.withValues(alpha: 0.3),
+                                    blurRadius: 6,
+                                  ),
+                                ],
+                              ),
+                              child: const Icon(
+                                Icons.camera_alt_rounded,
+                                size: 16,
+                                color: Color(0xFF0A192F),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 16),
+
+                      // Username
+                      Text(
+                        widget.username,
+                        style: const TextStyle(
+                          fontSize: 26,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.white,
+                          letterSpacing: 0.5,
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+
+                      // Badge Role
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 14,
+                          vertical: 4,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.cyanAccent.withValues(alpha: 0.15),
+                          borderRadius: BorderRadius.circular(20),
+                          border: Border.all(
+                            color: Colors.cyanAccent.withValues(alpha: 0.4),
+                          ),
+                        ),
+                        child: Text(
+                          displayRole,
+                          style: const TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                            color: Colors.cyanAccent,
+                            letterSpacing: 0.8,
+                          ),
+                        ),
+                      ),
+
+                      const SizedBox(height: 14),
+
+                      // Tenant Info Chip
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          const Icon(
+                            Icons.domain_rounded,
+                            size: 15,
+                            color: Colors.white60,
+                          ),
+                          const SizedBox(width: 6),
+                          Text(
+                            'Tenant ID: $_tenantId',
+                            style: const TextStyle(
+                              fontSize: 13,
+                              color: Colors.white70,
+                              fontWeight: FontWeight.w500,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+
+            const SizedBox(height: 24),
+
+            // --- SECTION SHELTER INFORMATION ---
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Row(
+                  children: [
+                    Icon(
+                      Icons.sensors_rounded,
+                      color: Colors.cyanAccent,
+                      size: 20,
+                    ),
+                    SizedBox(width: 8),
+                    Text(
+                      'SHELTER TERHUBUNG',
+                      style: TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.white70,
+                        letterSpacing: 1.2,
+                      ),
+                    ),
+                  ],
+                ),
+                IconButton(
+                  onPressed: () => _fetchFreshShelters(_tenantId),
+                  icon: const Icon(
+                    Icons.refresh_rounded,
+                    color: Colors.cyanAccent,
+                    size: 20,
+                  ),
+                  tooltip: 'Segarkan data shelter',
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+
+            if (_isLoading)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 24),
+                child: Center(
+                  child: CircularProgressIndicator(
+                    color: Colors.cyanAccent,
+                  ),
+                ),
+              )
+            else if (_shelters.isEmpty)
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(20),
+                decoration: BoxDecoration(
+                  color: Colors.white.withValues(alpha: 0.06),
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(
+                    color: Colors.white.withValues(alpha: 0.12),
+                  ),
+                ),
+                child: const Column(
+                  children: [
+                    Icon(
+                      Icons.info_outline_rounded,
+                      color: Colors.white54,
+                      size: 32,
+                    ),
+                    SizedBox(height: 8),
+                    Text(
+                      'Belum ada data shelter yang dimuat',
+                      style: TextStyle(color: Colors.white70, fontSize: 14),
+                    ),
+                  ],
+                ),
+              )
+            else
+              ..._shelters.map((shelter) {
+                final isSelected = shelter.id == _currentShelterId;
+                return Container(
+                  margin: const EdgeInsets.only(bottom: 12),
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: isSelected
+                        ? const Color(0xFF00E5FF).withValues(alpha: 0.12)
+                        : Colors.white.withValues(alpha: 0.06),
+                    borderRadius: BorderRadius.circular(18),
+                    border: Border.all(
+                      color: isSelected
+                          ? const Color(0xFF00E5FF).withValues(alpha: 0.6)
+                          : Colors.white.withValues(alpha: 0.12),
+                      width: isSelected ? 1.5 : 1,
+                    ),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      // Header Card Shelter
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.center,
+                        children: [
+                          Container(
+                            padding: const EdgeInsets.all(8),
+                            decoration: BoxDecoration(
+                              color: isSelected
+                                  ? const Color(0xFF00E5FF).withValues(alpha: 0.2)
+                                  : Colors.white.withValues(alpha: 0.1),
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                            child: Icon(
+                              Icons.apartment_rounded,
+                              color: isSelected
+                                  ? const Color(0xFF00E5FF)
+                                  : Colors.white70,
+                              size: 22,
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  shelter.name,
+                                  style: const TextStyle(
+                                    fontSize: 16,
+                                    fontWeight: FontWeight.bold,
+                                    color: Colors.white,
+                                  ),
+                                ),
+                                const SizedBox(height: 2),
+                                Text(
+                                  shelter.id,
+                                  style: const TextStyle(
+                                    fontSize: 12,
+                                    color: Colors.white60,
+                                    fontWeight: FontWeight.w500,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          if (isSelected)
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 10,
+                                vertical: 4,
+                              ),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFF00C853)
+                                    .withValues(alpha: 0.2),
+                                borderRadius: BorderRadius.circular(12),
+                                border: Border.all(
+                                  color: const Color(0xFF00C853),
+                                ),
+                              ),
+                              child: const Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(
+                                    Icons.check_circle_rounded,
+                                    color: Color(0xFF00C853),
+                                    size: 13,
+                                  ),
+                                  SizedBox(width: 4),
+                                  Text(
+                                    'Aktif',
+                                    style: TextStyle(
+                                      color: Color(0xFF00C853),
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            )
+                          else
+                            OutlinedButton(
+                              onPressed: () => _switchActiveShelter(shelter),
+                              style: OutlinedButton.styleFrom(
+                                side: BorderSide(
+                                  color: Colors.white.withValues(alpha: 0.3),
+                                ),
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 10,
+                                  vertical: 4,
+                                ),
+                                minimumSize: Size.zero,
+                                tapTargetSize:
+                                    MaterialTapTargetSize.shrinkWrap,
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(10),
+                                ),
+                              ),
+                              child: const Text(
+                                'Pilih',
+                                style: TextStyle(
+                                  color: Colors.white70,
+                                  fontSize: 11,
+                                ),
+                              ),
+                            ),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      const Divider(color: Colors.white12, height: 1),
+                      const SizedBox(height: 10),
+
+                      // Parameter Details (Koordinat & Radius)
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Row(
+                              children: [
+                                const Icon(
+                                  Icons.location_on_outlined,
+                                  size: 15,
+                                  color: Colors.cyanAccent,
+                                ),
+                                const SizedBox(width: 6),
+                                Expanded(
+                                  child: Text(
+                                    (shelter.latitude != null &&
+                                            shelter.longitude != null)
+                                        ? '${shelter.latitude!.toStringAsFixed(4)}, ${shelter.longitude!.toStringAsFixed(4)}'
+                                        : 'Belum diatur',
+                                    style: const TextStyle(
+                                      fontSize: 12,
+                                      color: Colors.white70,
+                                    ),
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          Row(
+                            children: [
+                              const Icon(
+                                Icons.radar_rounded,
+                                size: 15,
+                                color: Colors.amberAccent,
+                              ),
+                              const SizedBox(width: 6),
+                              Text(
+                                '${shelter.geofenceRadius.toInt()} m',
+                                style: const TextStyle(
+                                  fontSize: 12,
+                                  color: Colors.white70,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                );
+              }),
+
+            const SizedBox(height: 24),
+
+            // --- TOMBOL LOGOUT ---
+            SizedBox(
+              width: double.infinity,
+              height: 48,
+              child: ElevatedButton.icon(
+                onPressed: _confirmLogout,
+                icon: const Icon(Icons.logout_rounded, size: 20),
+                label: const Text(
+                  'Logout',
+                  style: TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 0.5,
+                  ),
+                ),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.redAccent.withValues(alpha: 0.9),
+                  foregroundColor: Colors.white,
+                  elevation: 2,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+          ],
         ),
       ),
     );
   }
 }
+
