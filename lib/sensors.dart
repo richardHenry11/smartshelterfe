@@ -50,16 +50,23 @@ class _SensorsPageState extends State<SensorsPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      backgroundColor: const Color(0xFF1E3C72),
       extendBody: true,
-      body: Container(
-        decoration: const BoxDecoration(
-          gradient: LinearGradient(
-            colors: [Color(0xFF1E3C72), Color(0xFF2A5298)],
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
+      extendBodyBehindAppBar: true,
+      body: SizedBox.expand(
+        child: DecoratedBox(
+          decoration: const BoxDecoration(
+            gradient: LinearGradient(
+              colors: [Color(0xFF1E3C72), Color(0xFF2A5298)],
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+            ),
+          ),
+          child: SafeArea(
+            bottom: false,
+            child: _widgetOptions.elementAt(_selectedIndex),
           ),
         ),
-        child: SafeArea(child: _widgetOptions.elementAt(_selectedIndex)),
       ),
       bottomNavigationBar: _buildModernBottomNavBar(),
     );
@@ -3931,11 +3938,10 @@ class _ProfileTabState extends State<ProfileTab> {
             : _role[0].toUpperCase() + _role.substring(1))
         : 'User';
 
-    return SafeArea(
-      child: SingleChildScrollView(
-        physics: const BouncingScrollPhysics(),
-        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 20),
-        child: Column(
+    return SingleChildScrollView(
+      physics: const BouncingScrollPhysics(),
+      padding: const EdgeInsets.fromLTRB(20, 16, 20, 110),
+      child: Column(
           children: [
             // --- KARTU PROFIL UTAMA (Glassmorphic) ---
             ClipRRect(
@@ -4437,8 +4443,7 @@ class _ProfileTabState extends State<ProfileTab> {
             const SizedBox(height: 16),
           ],
         ),
-      ),
-    );
+      );
   }
 }
 

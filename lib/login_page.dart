@@ -6,6 +6,7 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'config.dart';
+import 'register_page.dart';
 import 'sensors.dart';
 
 class LoginPage extends StatefulWidget {
@@ -331,8 +332,16 @@ class _LoginPageState extends State<LoginPage> {
                           style: TextStyle(color: Colors.white70, fontSize: 14),
                         ),
                         GestureDetector(
-                          onTap: () {
-                            // Navigate to register
+                          onTap: () async {
+                            final result = await Navigator.push<String>(
+                              context,
+                              MaterialPageRoute(
+                                builder: (context) => const RegisterPage(),
+                              ),
+                            );
+                            if (result != null && result.isNotEmpty) {
+                              _usernameController.text = result;
+                            }
                           },
                           child: const Text(
                             'Daftar',

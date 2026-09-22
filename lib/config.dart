@@ -40,6 +40,7 @@ class AppConfig {
 
   // --- Endpoint helper ---
   static Uri login() => Uri.parse('$httpBase/login');
+  static Uri register() => Uri.parse('$httpBase/register');
 
   static Uri shelters({String? tenantId}) => Uri.parse(
     tenantId != null && tenantId.isNotEmpty
