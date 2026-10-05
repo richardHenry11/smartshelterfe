@@ -52,8 +52,29 @@ Dokumentasi ini dibuat sebagai panduan integrasi bagi tim pengembang **Web Front
 
 ## 3. REST API Endpoints
 
-### 3.1 `POST /register`
-Digunakan untuk mendaftarkan akun user baru ke database server.
+### 3.1 `GET /tenants`
+Mendapatkan daftar organisasi/perusahaan yang telah terdaftar di database server.
+
+- **URL:** `/tenants`
+- **Method:** `GET`
+- **Response Success (`200 OK`):**
+```json
+[
+  {
+    "id": "TENANT-01",
+    "name": "PT Cakrawala Bima Instrumen"
+  },
+  {
+    "id": "TENANT-02",
+    "name": "PT Smart Shelter Nusantara"
+  }
+]
+```
+
+---
+
+### 3.2 `POST /register`
+Digunakan untuk mendaftarkan akun user baru ke database server. Cukup kirimkan nama perusahaan (`company_name`), dan sistem backend akan otomatis mencocokkan atau membuatkan `tenant_id` serta shelter awal yang sesuai.
 
 - **URL:** `/register`
 - **Method:** `POST`
@@ -64,24 +85,29 @@ Digunakan untuk mendaftarkan akun user baru ke database server.
   "username": "operator1",
   "password": "mypassword123",
   "role": "user",
-  "tenant_id": "TENANT-01"
+  "company_name": "PT Cakrawala Bima Instrumen"
 }
 ```
-> Catatan: Jika `role` tidak diisi, default adalah `"user"`. Jika `tenant_id` tidak diisi, default adalah `"TENANT-01"`. Panjang username dan password minimal 3 karakter.
+> Catatan:
+> - `company_name`: Masukkan nama perusahaan yang dipilih/diketik user. Sistem backend akan otomatis mencari `tenant_id` perusahaan tersebut. Jika nama perusahaan baru didaftarkan, backend otomatis membuat record tenant & shelter baru.
+> - `role`: Default adalah `"user"`.
+> - Panjang `username` dan `password` minimal 3 karakter.
 
 - **Response Success (`201 Created` / `200 OK`):**
 ```json
 {
-  "message": "User registered successfully",
+  "message": "Pendaftaran berhasil! Silakan masuk dengan akun baru Anda.",
   "username": "operator1",
-  "tenant_id": "TENANT-01"
+  "role": "user",
+  "tenant_id": "TENANT-01",
+  "company_name": "PT Cakrawala Bima Instrumen"
 }
 ```
 
-- **Response Error Duplicate (`400 Bad Request`):**
+- **Response Error Duplicate (`409 Conflict` / `400 Bad Request`):**
 ```json
 {
-  "detail": "Username already exists"
+  "detail": "Username sudah terdaftar, silakan gunakan username lain"
 }
 ```
 
@@ -283,7 +309,46 @@ Menghapus foto profil user (mengosongkan field di database ke `NULL`).
 
 ---
 
-### 3.7 `POST /admin/aggregate`
+### 3.7 `GET /user/profile`
+Mengambil informasi profil user terbaru langsung dari database (termasuk username, email, role, tenant_id, dan foto profile).
+
+- **URL:** `/user/profile?username=coki`
+- **Method:** `GET`
+- **Query Params:**
+  - `username`: Username atau email akun target.
+
+- **Response Success (`200 OK`):**
+```json
+{
+  "username": "coki",
+  "email": "coki@gmail.com",
+  "role": "admin",
+  "tenant_id": "TENANT-01",
+  "foto_profile": "/uploads/avatars/coki_1727000000.jpg"
+}
+```
+
+---
+
+### 3.8 `DELETE /user/account`
+Menghapus akun pengguna secara permanen dari tabel `users` database, sekaligus membersihkan file foto profil yang tersimpan di disk.
+
+- **URL:** `/user/account?username=coki`
+- **Method:** `DELETE`
+- **Query Params:**
+  - `username`: Username atau email target yang ingin dihapus.
+
+- **Response Success (`200 OK`):**
+```json
+{
+  "message": "Akun berhasil dihapus secara permanen",
+  "username": "coki"
+}
+```
+
+---
+
+### 3.9 `POST /admin/aggregate`
 Menjalankan agregasi rata-rata 30-menit sensor secara manual (biasanya otomatis berjalan setiap 30 menit).
 
 - **URL:** `/admin/aggregate`
@@ -305,7 +370,82 @@ Menjalankan agregasi rata-rata 30-menit sensor secara manual (biasanya otomatis 
 
 ---
 
-### 3.8 Static Files (URL Foto Profil)
+### 3.8 `GET /sensor/thresholds`
+Mengambil batas nilai ambang batas (threshold min/max), status alarm per sensor, serta konfigurasi saklar audio alarm terintegrasi (`audio_alarm`) untuk shelter tertentu.
+
+- **URL:** `/sensor/thresholds?shelter_id={shelter_id}`
+- **Method:** `GET`
+- **Query Params:**
+  - `shelter_id` (string, opsional, default: `SHELTER-01`): ID shelter target.
+
+- **Response Success (`200 OK`):**
+```json
+{
+  "shelter_id": "SHELTER-01",
+  "audio_alarm": true,
+  "thresholds": [
+    {
+      "sensor_key": "nh4",
+      "min_value": 0.5,
+      "max_value": 10.2,
+      "is_active": true,
+      "audio_alarm": true
+    },
+    {
+      "sensor_key": "o2",
+      "min_value": 19.5,
+      "max_value": 23.5,
+      "is_active": true,
+      "audio_alarm": true
+    }
+  ]
+}
+```
+
+---
+
+### 3.9 `POST /sensor/thresholds`
+Menyimpan atau memperbarui batas nilai ambang batas (threshold min/max), status aktif, dan saklar audio alarm (`audio_alarm`) untuk shelter tertentu (`UPSERT`). Menjadikan konfigurasi audio terpusat 1 pintu untuk Web maupun Android.
+
+- **URL:** `/sensor/thresholds`
+- **Method:** `POST`
+- **Headers:** `Content-Type: application/json`
+- **Request Body:**
+```json
+{
+  "shelter_id": "SHELTER-01",
+  "audio_alarm": true,
+  "thresholds": [
+    {
+      "sensor_key": "nh4",
+      "min_value": 0.5,
+      "max_value": 10.2,
+      "is_active": true,
+      "audio_alarm": true
+    },
+    {
+      "sensor_key": "o2",
+      "min_value": 19.5,
+      "max_value": 23.5,
+      "is_active": true,
+      "audio_alarm": true
+    }
+  ]
+}
+```
+
+- **Response Success (`200 OK`):**
+```json
+{
+  "message": "Pengaturan alarm & batas nilai sensor berhasil disimpan",
+  "shelter_id": "SHELTER-01",
+  "count": 2
+}
+```
+
+---
+
+### 3.10 Static Files (URL Foto Profil)
 Foto profil yang telah di-upload dapat diakses langsung oleh browser atau tag `<img>` melalui:
 ```
 https://shelter.cbinstrument.com/uploads/avatars/{filename}

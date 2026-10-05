@@ -13,9 +13,14 @@ import 'dart:convert';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:http/http.dart' as http;
 import 'package:geolocator/geolocator.dart';
+import 'package:flutter/services.dart';
+import 'package:audioplayers/audioplayers.dart';
 
 import 'config.dart';
 import 'login_page.dart';
+import 'app_notification.dart';
+
+const String kAlarmAudioPath = 'sounds/swedish_rhapsody_low_pitch.mp3';
 
 class SensorsPage extends StatefulWidget {
   final String username;
@@ -339,12 +344,754 @@ class ShelterData {
   }
 
   Map<String, dynamic> toJson() => {
-        'id': id,
-        'name': name,
-        'latitude': latitude,
-        'longitude': longitude,
-        'geofence_radius': geofenceRadius,
-      };
+    'id': id,
+    'name': name,
+    'latitude': latitude,
+    'longitude': longitude,
+    'geofence_radius': geofenceRadius,
+  };
+}
+
+// ---------------- MODEL SENSOR THRESHOLD / ALARM ----------------
+class SensorThreshold {
+  final String sensorKey;
+  final double? minValue;
+  final double? maxValue;
+  final bool isActive;
+  final bool audioAlarm;
+
+  SensorThreshold({
+    required this.sensorKey,
+    this.minValue,
+    this.maxValue,
+    this.isActive = true,
+    this.audioAlarm = true,
+  });
+
+  factory SensorThreshold.fromJson(Map<String, dynamic> json) {
+    return SensorThreshold(
+      sensorKey: json['sensor_key']?.toString() ?? '',
+      minValue: json['min_value'] != null
+          ? (json['min_value'] as num).toDouble()
+          : null,
+      maxValue: json['max_value'] != null
+          ? (json['max_value'] as num).toDouble()
+          : null,
+      isActive: json['is_active'] == true || json['is_active'] == 1,
+      audioAlarm:
+          json['audio_alarm'] == null ||
+          json['audio_alarm'] == true ||
+          json['audio_alarm'] == 1,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'sensor_key': sensorKey,
+    'min_value': minValue,
+    'max_value': maxValue,
+    'is_active': isActive,
+    'audio_alarm': audioAlarm,
+  };
+
+  SensorThreshold copyWith({
+    String? sensorKey,
+    double? minValue,
+    double? maxValue,
+    bool? isActive,
+    bool? audioAlarm,
+    bool clearMin = false,
+    bool clearMax = false,
+  }) {
+    return SensorThreshold(
+      sensorKey: sensorKey ?? this.sensorKey,
+      minValue: clearMin ? null : (minValue ?? this.minValue),
+      maxValue: clearMax ? null : (maxValue ?? this.maxValue),
+      isActive: isActive ?? this.isActive,
+      audioAlarm: audioAlarm ?? this.audioAlarm,
+    );
+  }
+}
+
+// ---------------- DIALOG PENGATURAN ALARM & BATAS SENSOR ----------------
+class SensorAlarmSettingsDialog extends StatefulWidget {
+  final String shelterId;
+  final String shelterName;
+  final VoidCallback? onSaved;
+
+  const SensorAlarmSettingsDialog({
+    super.key,
+    required this.shelterId,
+    required this.shelterName,
+    this.onSaved,
+  });
+
+  @override
+  State<SensorAlarmSettingsDialog> createState() =>
+      _SensorAlarmSettingsDialogState();
+}
+
+class _SensorAlarmSettingsDialogState extends State<SensorAlarmSettingsDialog> {
+  final AudioPlayer _audioPlayer = AudioPlayer();
+  List<SensorMeta> _dialogSensors = [];
+  final Map<String, TextEditingController> _minControllers = {};
+  final Map<String, TextEditingController> _maxControllers = {};
+  final Map<String, bool> _activeFlags = {};
+
+  bool _isAudioEnabled = true;
+  bool _isLoading = true;
+  bool _isSubmitting = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _initDialogData();
+  }
+
+  @override
+  void dispose() {
+    _audioPlayer.dispose();
+    for (final c in _minControllers.values) {
+      c.dispose();
+    }
+    for (final c in _maxControllers.values) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  Future<void> _initDialogData() async {
+    final prefs = await SharedPreferences.getInstance();
+
+    _isAudioEnabled = prefs.getBool('audio_alarm_enabled') ?? true;
+
+    // Load sensors
+    List<SensorMeta> loaded = [];
+    final String? savedJson = prefs.getString('custom_sensors_list');
+    if (savedJson != null && savedJson.isNotEmpty) {
+      try {
+        final List<dynamic> decoded = jsonDecode(savedJson);
+        loaded = decoded.map((e) => SensorMeta.fromJson(e)).toList();
+      } catch (_) {}
+    }
+    if (loaded.isEmpty) {
+      loaded = List.from(defaultSensors);
+    }
+    if (!loaded.any((s) => s.key == 'nh4')) loaded.insert(0, kSensorNH4);
+    if (!loaded.any((s) => s.key == 'o2')) loaded.insert(1, kSensorO2);
+    if (!loaded.any((s) => s.key == 'temperature'))
+      loaded.add(defaultSensors[2]);
+    if (!loaded.any((s) => s.key == 'humidity')) loaded.add(defaultSensors[3]);
+
+    // Load cached thresholds
+    final cached = prefs.getString('thresholds_${widget.shelterId}');
+    Map<String, SensorThreshold> tMap = {};
+    if (cached != null && cached.isNotEmpty) {
+      try {
+        final List<dynamic> dec = jsonDecode(cached);
+        for (final item in dec) {
+          final t = SensorThreshold.fromJson(item);
+          tMap[t.sensorKey] = t;
+        }
+      } catch (_) {}
+    }
+
+    _dialogSensors = loaded;
+    for (final s in _dialogSensors) {
+      final current = tMap[s.key];
+      _minControllers[s.key] = TextEditingController(
+        text: current?.minValue != null ? current!.minValue.toString() : '',
+      );
+      _maxControllers[s.key] = TextEditingController(
+        text: current?.maxValue != null ? current!.maxValue.toString() : '',
+      );
+      _activeFlags[s.key] = current?.isActive ?? true;
+    }
+
+    if (mounted) {
+      setState(() {
+        _isLoading = false;
+      });
+    }
+
+    // Fetch fresh from API
+    try {
+      final res = await http
+          .get(AppConfig.sensorThresholds(shelterId: widget.shelterId))
+          .timeout(const Duration(seconds: 5));
+      if (res.statusCode == 200 && mounted) {
+        final data = jsonDecode(res.body);
+        if (data['audio_alarm'] != null) {
+          final serverAudio =
+              data['audio_alarm'] == true || data['audio_alarm'] == 1;
+          _isAudioEnabled = serverAudio;
+          await prefs.setBool('audio_alarm_enabled', serverAudio);
+        }
+        final List<dynamic> list = data['thresholds'] ?? [];
+        final freshMap = <String, SensorThreshold>{};
+        for (final item in list) {
+          final t = SensorThreshold.fromJson(item);
+          freshMap[t.sensorKey] = t;
+        }
+        await prefs.setString(
+          'thresholds_${widget.shelterId}',
+          jsonEncode(list),
+        );
+        setState(() {
+          for (final s in _dialogSensors) {
+            final current = freshMap[s.key];
+            if (current != null) {
+              _minControllers[s.key]?.text = current.minValue != null
+                  ? current.minValue.toString()
+                  : '';
+              _maxControllers[s.key]?.text = current.maxValue != null
+                  ? current.maxValue.toString()
+                  : '';
+              _activeFlags[s.key] = current.isActive;
+            }
+          }
+        });
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _testAlarmSound() async {
+    try {
+      HapticFeedback.heavyImpact();
+      await _audioPlayer.stop();
+      await _audioPlayer.play(AssetSource(kAlarmAudioPath), volume: 1.0);
+    } catch (e) {
+      debugPrint('Error testing alarm sound: $e');
+    }
+  }
+
+  Future<void> _saveSettings() async {
+    if (widget.shelterId.isEmpty) return;
+    setState(() => _isSubmitting = true);
+
+    final List<SensorThreshold> listToSave = [];
+    for (final s in _dialogSensors) {
+      final isAct = _activeFlags[s.key] ?? true;
+      final minText =
+          _minControllers[s.key]?.text.trim().replaceAll(',', '.') ?? '';
+      final maxText =
+          _maxControllers[s.key]?.text.trim().replaceAll(',', '.') ?? '';
+
+      final minVal = minText.isNotEmpty ? double.tryParse(minText) : null;
+      final maxVal = maxText.isNotEmpty ? double.tryParse(maxText) : null;
+
+      listToSave.add(
+        SensorThreshold(
+          sensorKey: s.key,
+          minValue: minVal,
+          maxValue: maxVal,
+          isActive: isAct,
+          audioAlarm: _isAudioEnabled,
+        ),
+      );
+    }
+
+    bool success = false;
+    try {
+      final body = jsonEncode({
+        'shelter_id': widget.shelterId,
+        'audio_alarm': _isAudioEnabled,
+        'thresholds': listToSave.map((e) => e.toJson()).toList(),
+      });
+      final res = await http
+          .post(
+            AppConfig.saveSensorThresholds(),
+            headers: {'Content-Type': 'application/json'},
+            body: body,
+          )
+          .timeout(const Duration(seconds: 8));
+
+      if (res.statusCode == 200) {
+        success = true;
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setString(
+          'thresholds_${widget.shelterId}',
+          jsonEncode(listToSave.map((e) => e.toJson()).toList()),
+        );
+        await prefs.setBool('audio_alarm_enabled', _isAudioEnabled);
+      }
+    } catch (e) {
+      debugPrint('Error saving thresholds: $e');
+    }
+
+    if (!mounted) return;
+    setState(() => _isSubmitting = false);
+    Navigator.pop(context);
+
+    widget.onSaved?.call();
+
+    if (success) {
+      AppNotification.success(
+        context,
+        'Pengaturan alarm sensor berhasil disimpan ke database!',
+      );
+    } else {
+      AppNotification.error(
+        context,
+        'Gagal menyimpan alarm ke server database.',
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      backgroundColor: const Color(0xFF142442),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(24),
+        side: BorderSide(
+          color: Colors.white.withValues(alpha: 0.18),
+          width: 1.2,
+        ),
+      ),
+      titlePadding: const EdgeInsets.fromLTRB(20, 20, 20, 10),
+      title: Row(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: Colors.orangeAccent.withValues(alpha: 0.2),
+              shape: BoxShape.circle,
+              border: Border.all(
+                color: Colors.orangeAccent.withValues(alpha: 0.5),
+                width: 1.2,
+              ),
+            ),
+            child: const Icon(
+              Icons.alarm_on_rounded,
+              color: Colors.orangeAccent,
+              size: 24,
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Setting Alarm Sensor',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  'Shelter: ${widget.shelterName} (${widget.shelterId})',
+                  style: const TextStyle(color: Colors.white70, fontSize: 12),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+      content: SizedBox(
+        width: double.maxFinite,
+        child: _isLoading
+            ? const SizedBox(
+                height: 160,
+                child: Center(
+                  child: CircularProgressIndicator(color: Colors.orangeAccent),
+                ),
+              )
+            : SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF00E5FF).withValues(alpha: 0.1),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: const Color(0xFF00E5FF).withValues(alpha: 0.3),
+                          width: 1,
+                        ),
+                      ),
+                      child: const Row(
+                        children: [
+                          Icon(
+                            Icons.info_outline_rounded,
+                            color: Color(0xFF00E5FF),
+                            size: 18,
+                          ),
+                          SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              'Alarm akan aktif dan memberi tanda peringatan jika nilai sensor keluar dari batas Min atau Max.',
+                              style: TextStyle(
+                                color: Colors.white70,
+                                fontSize: 11.5,
+                                height: 1.3,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+
+                    // Card Pengaturan Suara Alarm Keras (Sirene Bahaya)
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: _isAudioEnabled
+                            ? Colors.redAccent.withValues(alpha: 0.12)
+                            : Colors.white.withValues(alpha: 0.05),
+                        borderRadius: BorderRadius.circular(16),
+                        border: Border.all(
+                          color: _isAudioEnabled
+                              ? Colors.redAccent.withValues(alpha: 0.5)
+                              : Colors.white.withValues(alpha: 0.12),
+                          width: 1.2,
+                        ),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Container(
+                                padding: const EdgeInsets.all(7),
+                                decoration: BoxDecoration(
+                                  color: _isAudioEnabled
+                                      ? Colors.redAccent.withValues(alpha: 0.25)
+                                      : Colors.white.withValues(alpha: 0.1),
+                                  shape: BoxShape.circle,
+                                ),
+                                child: Icon(
+                                  _isAudioEnabled
+                                      ? Icons.volume_up_rounded
+                                      : Icons.volume_off_rounded,
+                                  color: _isAudioEnabled
+                                      ? Colors.redAccent
+                                      : Colors.white60,
+                                  size: 18,
+                                ),
+                              ),
+                              const SizedBox(width: 10),
+                              const Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      'Suara Alarm Keras (Sirene)',
+                                      style: TextStyle(
+                                        color: Colors.white,
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 13.5,
+                                      ),
+                                    ),
+                                    SizedBox(height: 2),
+                                    Text(
+                                      'Bunyi sirene keras saat nilai di luar batas normal',
+                                      style: TextStyle(
+                                        color: Colors.white60,
+                                        fontSize: 10.5,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              Switch(
+                                value: _isAudioEnabled,
+                                activeThumbColor: Colors.redAccent,
+                                onChanged: (val) {
+                                  setState(() {
+                                    _isAudioEnabled = val;
+                                  });
+                                },
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 10),
+                          SizedBox(
+                            width: double.infinity,
+                            child: OutlinedButton.icon(
+                              onPressed: () => _testAlarmSound(),
+                              icon: const Icon(
+                                Icons.play_circle_fill_rounded,
+                                color: Colors.orangeAccent,
+                                size: 18,
+                              ),
+                              label: const Text(
+                                'Tes Bunyi Alarm (Sirene Keras)',
+                                style: TextStyle(
+                                  color: Colors.orangeAccent,
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                              style: OutlinedButton.styleFrom(
+                                side: BorderSide(
+                                  color: Colors.orangeAccent.withValues(
+                                    alpha: 0.6,
+                                  ),
+                                  width: 1,
+                                ),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(10),
+                                ),
+                                padding: const EdgeInsets.symmetric(
+                                  vertical: 8,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    ..._dialogSensors.map((s) {
+                      final isAct = _activeFlags[s.key] ?? true;
+                      final minCtrl = _minControllers[s.key]!;
+                      final maxCtrl = _maxControllers[s.key]!;
+
+                      return Container(
+                        margin: const EdgeInsets.only(bottom: 14),
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: Colors.white.withValues(alpha: 0.05),
+                          borderRadius: BorderRadius.circular(16),
+                          border: Border.all(
+                            color: isAct
+                                ? s.color.withValues(alpha: 0.35)
+                                : Colors.white.withValues(alpha: 0.1),
+                            width: 1.2,
+                          ),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                Container(
+                                  padding: const EdgeInsets.all(6),
+                                  decoration: BoxDecoration(
+                                    color: s.color.withValues(alpha: 0.2),
+                                    borderRadius: BorderRadius.circular(8),
+                                  ),
+                                  child: Icon(s.icon, size: 16, color: s.color),
+                                ),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: Text(
+                                    '${s.title} (${s.unit})',
+                                    style: TextStyle(
+                                      color: isAct
+                                          ? Colors.white
+                                          : Colors.white54,
+                                      fontWeight: FontWeight.bold,
+                                      fontSize: 14,
+                                    ),
+                                  ),
+                                ),
+                                Switch(
+                                  value: isAct,
+                                  activeThumbColor: s.color,
+                                  onChanged: (val) {
+                                    setState(() {
+                                      _activeFlags[s.key] = val;
+                                    });
+                                  },
+                                ),
+                              ],
+                            ),
+                            if (isAct) ...[
+                              const SizedBox(height: 10),
+                              Row(
+                                children: [
+                                  Expanded(
+                                    child: TextField(
+                                      controller: minCtrl,
+                                      keyboardType:
+                                          const TextInputType.numberWithOptions(
+                                            decimal: true,
+                                            signed: true,
+                                          ),
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 13,
+                                      ),
+                                      decoration: InputDecoration(
+                                        labelText: 'Batas Min',
+                                        hintText: 'Misal: 0.5',
+                                        labelStyle: const TextStyle(
+                                          color: Colors.white70,
+                                          fontSize: 12,
+                                        ),
+                                        hintStyle: const TextStyle(
+                                          color: Colors.white30,
+                                          fontSize: 11,
+                                        ),
+                                        suffixText: s.unit,
+                                        suffixStyle: TextStyle(
+                                          color: s.color,
+                                          fontSize: 11,
+                                        ),
+                                        filled: true,
+                                        fillColor: Colors.black.withValues(
+                                          alpha: 0.2,
+                                        ),
+                                        isDense: true,
+                                        contentPadding:
+                                            const EdgeInsets.symmetric(
+                                              horizontal: 10,
+                                              vertical: 10,
+                                            ),
+                                        border: OutlineInputBorder(
+                                          borderRadius: BorderRadius.circular(
+                                            10,
+                                          ),
+                                          borderSide: BorderSide(
+                                            color: Colors.white.withValues(
+                                              alpha: 0.2,
+                                            ),
+                                          ),
+                                        ),
+                                        enabledBorder: OutlineInputBorder(
+                                          borderRadius: BorderRadius.circular(
+                                            10,
+                                          ),
+                                          borderSide: BorderSide(
+                                            color: Colors.white.withValues(
+                                              alpha: 0.2,
+                                            ),
+                                          ),
+                                        ),
+                                        focusedBorder: OutlineInputBorder(
+                                          borderRadius: BorderRadius.circular(
+                                            10,
+                                          ),
+                                          borderSide: BorderSide(
+                                            color: s.color,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 10),
+                                  Expanded(
+                                    child: TextField(
+                                      controller: maxCtrl,
+                                      keyboardType:
+                                          const TextInputType.numberWithOptions(
+                                            decimal: true,
+                                            signed: true,
+                                          ),
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 13,
+                                      ),
+                                      decoration: InputDecoration(
+                                        labelText: 'Batas Max',
+                                        hintText: 'Misal: 10.2',
+                                        labelStyle: const TextStyle(
+                                          color: Colors.white70,
+                                          fontSize: 12,
+                                        ),
+                                        hintStyle: const TextStyle(
+                                          color: Colors.white30,
+                                          fontSize: 11,
+                                        ),
+                                        suffixText: s.unit,
+                                        suffixStyle: TextStyle(
+                                          color: s.color,
+                                          fontSize: 11,
+                                        ),
+                                        filled: true,
+                                        fillColor: Colors.black.withValues(
+                                          alpha: 0.2,
+                                        ),
+                                        isDense: true,
+                                        contentPadding:
+                                            const EdgeInsets.symmetric(
+                                              horizontal: 10,
+                                              vertical: 10,
+                                            ),
+                                        border: OutlineInputBorder(
+                                          borderRadius: BorderRadius.circular(
+                                            10,
+                                          ),
+                                          borderSide: BorderSide(
+                                            color: Colors.white.withValues(
+                                              alpha: 0.2,
+                                            ),
+                                          ),
+                                        ),
+                                        enabledBorder: OutlineInputBorder(
+                                          borderRadius: BorderRadius.circular(
+                                            10,
+                                          ),
+                                          borderSide: BorderSide(
+                                            color: Colors.white.withValues(
+                                              alpha: 0.2,
+                                            ),
+                                          ),
+                                        ),
+                                        focusedBorder: OutlineInputBorder(
+                                          borderRadius: BorderRadius.circular(
+                                            10,
+                                          ),
+                                          borderSide: BorderSide(
+                                            color: s.color,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ],
+                        ),
+                      );
+                    }),
+                  ],
+                ),
+              ),
+      ),
+      actionsPadding: const EdgeInsets.fromLTRB(20, 0, 20, 16),
+      actions: [
+        TextButton(
+          onPressed: _isSubmitting ? null : () => Navigator.pop(context),
+          child: const Text('Batal', style: TextStyle(color: Colors.white60)),
+        ),
+        ElevatedButton(
+          onPressed: _isSubmitting ? null : _saveSettings,
+          style: ElevatedButton.styleFrom(
+            backgroundColor: Colors.orangeAccent,
+            foregroundColor: Colors.black87,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+            ),
+            padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
+          ),
+          child: _isSubmitting
+              ? const SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: Colors.black87,
+                  ),
+                )
+              : const Text(
+                  'Simpan Setting',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+        ),
+      ],
+    );
+  }
 }
 
 // ---------------- DASHBOARD TAB ----------------
@@ -360,23 +1107,9 @@ class _DashboardTabState extends State<DashboardTab> {
   StreamSubscription? _wsSub;
 
   // Multi-Tenant / Multi-Shelter state
-  String currentShelterId = 'SHELTER-01';
-  List<ShelterData> availableShelters = [
-    ShelterData(
-      id: 'SHELTER-01',
-      name: 'Shelter Site Alpha (Pusat)',
-      latitude: -6.90240000,
-      longitude: 107.61870000,
-      geofenceRadius: 100,
-    ),
-    ShelterData(
-      id: 'SHELTER-02',
-      name: 'Shelter Site Beta (Cabang)',
-      latitude: -6.91474400,
-      longitude: 107.60981000,
-      geofenceRadius: 150,
-    ),
-  ];
+  String currentShelterId = '';
+  List<ShelterData> availableShelters = [];
+  int _historyRequestId = 0;
 
   // Dynamic Realtime sensor values: {"nh4": "1.2", "o2": "20.9", ...}
   Map<String, String> sensorValues = {};
@@ -399,6 +1132,85 @@ class _DashboardTabState extends State<DashboardTab> {
   List<String> historyFullDateLabels = [];
   bool isLoadingHistory = true;
 
+  // Sensor Thresholds / Alarm state: { "nh4": SensorThreshold(...), ... }
+  Map<String, SensorThreshold> sensorThresholds = {};
+
+  ({bool isAlarm, String? message}) getAlarmState(
+    String sensorKey,
+    String? rawVal,
+  ) {
+    if (rawVal == null || rawVal.isEmpty || rawVal == '--') {
+      return (isAlarm: false, message: null);
+    }
+    final threshold = sensorThresholds[sensorKey];
+    if (threshold == null || !threshold.isActive) {
+      return (isAlarm: false, message: null);
+    }
+    final val = double.tryParse(rawVal);
+    if (val == null) {
+      return (isAlarm: false, message: null);
+    }
+
+    if (threshold.minValue != null && val < threshold.minValue!) {
+      return (isAlarm: true, message: 'Di bawah min (${threshold.minValue})');
+    }
+    if (threshold.maxValue != null && val > threshold.maxValue!) {
+      return (isAlarm: true, message: 'Melebihi max (${threshold.maxValue})');
+    }
+    return (isAlarm: false, message: null);
+  }
+
+  int get activeAlarmCount {
+    int count = 0;
+    for (final s in sensors) {
+      final raw = sensorValues[s.key];
+      if (getAlarmState(s.key, raw).isAlarm) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  // Audio Player untuk Alarm Suara Keras (Hazard Siren)
+  final AudioPlayer _audioPlayer = AudioPlayer();
+  bool isAudioAlarmEnabled = true;
+
+  Future<void> _initAudioPlayer() async {
+    try {
+      await _audioPlayer.setReleaseMode(ReleaseMode.loop);
+      await _audioPlayer.setVolume(1.0);
+    } catch (_) {}
+    final prefs = await SharedPreferences.getInstance();
+    if (mounted) {
+      setState(() {
+        isAudioAlarmEnabled = prefs.getBool('audio_alarm_enabled') ?? true;
+      });
+    }
+  }
+
+  void _triggerAlarmSoundIfNeeded() {
+    // 1. Jika audio alarm dinonaktifkan atau semua parameter sensor AMAN/NORMAL
+    if (!isAudioAlarmEnabled || activeAlarmCount == 0) {
+      // Langsung hentikan lagu seketika, tidak perlu tunggu lagu selesai
+      if (_audioPlayer.state != PlayerState.stopped) {
+        _audioPlayer.stop();
+      }
+      return;
+    }
+
+    // 2. Jika ada parameter sensor yang OUT-OF-RANGE (Bahaya):
+    // Bunyikan alarm berulang (loop) jika belum menyala
+    if (_audioPlayer.state != PlayerState.playing) {
+      try {
+        HapticFeedback.heavyImpact();
+        _audioPlayer.setReleaseMode(ReleaseMode.loop);
+        _audioPlayer.play(AssetSource(kAlarmAudioPath), volume: 1.0);
+      } catch (e) {
+        debugPrint('Error playing loud alarm sound: $e');
+      }
+    }
+  }
+
   SensorMeta get selectedSensor {
     return sensors.firstWhere(
       (s) => s.key == _selectedSensorKey,
@@ -416,6 +1228,7 @@ class _DashboardTabState extends State<DashboardTab> {
   @override
   void initState() {
     super.initState();
+    _initAudioPlayer();
     _loadSensors();
     _loadAppCustomization();
     _loadShelters();
@@ -426,17 +1239,18 @@ class _DashboardTabState extends State<DashboardTab> {
     final savedShelterId = prefs.getString('current_shelter_id');
     final savedSheltersJson = prefs.getString('available_shelters');
 
+    List<ShelterData> loaded = [];
     if (savedSheltersJson != null && savedSheltersJson.isNotEmpty) {
       try {
         final List<dynamic> decoded = jsonDecode(savedSheltersJson);
-        final loaded = decoded.map((e) => ShelterData.fromJson(e)).toList();
+        loaded = decoded.map((e) => ShelterData.fromJson(e)).toList();
         if (loaded.isNotEmpty && mounted) {
           setState(() {
             availableShelters = loaded;
           });
         }
       } catch (e) {
-        print('Error decoding saved shelters: $e');
+        debugPrint('Error decoding saved shelters: $e');
       }
     }
 
@@ -449,23 +1263,32 @@ class _DashboardTabState extends State<DashboardTab> {
       await prefs.setString('current_shelter_id', activeId);
     }
 
-    final activeShelter = availableShelters.firstWhere(
-      (s) => s.id == activeId,
-      orElse: () => ShelterData(id: activeId, name: activeId),
-    );
+    if (activeId.isNotEmpty) {
+      final activeShelter = availableShelters.firstWhere(
+        (s) => s.id == activeId,
+        orElse: () => ShelterData(id: activeId, name: activeId),
+      );
 
-    if (mounted) {
-      setState(() {
-        currentShelterId = activeId;
-        appTitle = activeShelter.name;
-      });
+      if (mounted) {
+        setState(() {
+          currentShelterId = activeId;
+          appTitle = activeShelter.name;
+        });
+      }
     }
 
-    // Sambungkan WebSocket & fetch history sesuai shelter yang telah terpilih
-    _connectWebSocket();
-    _fetchHistory(selectedSensor.key);
+    // Pertama sinkronkan shelter dari API agar akurat sesuai tenant akun aktif
+    final shelterBeforeApi = currentShelterId;
+    await _fetchSheltersFromApi();
 
-    _fetchSheltersFromApi();
+    // Sambungkan WebSocket & fetch history jika belum dijalankan oleh _changeShelter
+    if (currentShelterId.isNotEmpty &&
+        currentShelterId == shelterBeforeApi &&
+        channel == null) {
+      _connectWebSocket();
+      _fetchHistory(selectedSensor.key);
+      _fetchThresholds();
+    }
   }
 
   Future<void> _fetchSheltersFromApi() async {
@@ -481,20 +1304,25 @@ class _DashboardTabState extends State<DashboardTab> {
         final List<dynamic> list = data['shelters'] ?? [];
         if (list.isNotEmpty && mounted) {
           final loaded = list.map((e) => ShelterData.fromJson(e)).toList();
-          final activeShelter = loaded.firstWhere(
-            (s) => s.id == currentShelterId,
-            orElse: () => loaded.first,
-          );
+          await prefs.setString('available_shelters', jsonEncode(list));
 
           setState(() {
             availableShelters = loaded;
-            appTitle = activeShelter.name;
           });
-          await prefs.setString('available_shelters', jsonEncode(list));
 
           // Jika shelter saat ini tidak ada di daftar tenant user, otomatis beralih ke shelter pertama milik tenant
-          if (!loaded.any((s) => s.id == currentShelterId)) {
-            _changeShelter(loaded.first.id);
+          if (currentShelterId.isEmpty ||
+              !loaded.any((s) => s.id == currentShelterId)) {
+            await _changeShelter(loaded.first.id);
+          } else {
+            final activeShelter = loaded.firstWhere(
+              (s) => s.id == currentShelterId,
+              orElse: () => loaded.first,
+            );
+            setState(() {
+              appTitle = activeShelter.name;
+            });
+            _fetchThresholds();
           }
         }
       }
@@ -502,13 +1330,12 @@ class _DashboardTabState extends State<DashboardTab> {
   }
 
   Future<void> _changeShelter(String newShelterId) async {
-    if (newShelterId == currentShelterId) return;
-
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('current_shelter_id', newShelterId);
 
-    // Putuskan WebSocket lama; akan tersambung ulang ke shelter baru
+    // Putuskan WebSocket lama dan matikan audio alarm shelter sebelumnya
     _disconnectWebSocket();
+    _audioPlayer.stop();
 
     // Cari koordinat shelter baru untuk update geofence otomatis
     final newShelter = availableShelters.firstWhere(
@@ -529,6 +1356,7 @@ class _DashboardTabState extends State<DashboardTab> {
       });
       _connectWebSocket();
       _fetchHistory(selectedSensor.key);
+      _fetchThresholds();
     }
   }
 
@@ -578,46 +1406,25 @@ class _DashboardTabState extends State<DashboardTab> {
           .put(
             AppConfig.updateShelter(currentShelterId),
             headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({
-              'name': title,
-            }),
+            body: jsonEncode({'name': title}),
           )
           .timeout(const Duration(seconds: 8));
 
       if (response.statusCode == 200 && mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(
-              'Nama shelter berhasil diperbarui di database!',
-            ),
-            backgroundColor: Color(0xFF00C853),
-            behavior: SnackBarBehavior.floating,
-            duration: Duration(seconds: 2),
-          ),
+        AppNotification.success(
+          context,
+          'Nama shelter berhasil diperbarui di database!',
         );
       } else if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              'Gagal update database (HTTP ${response.statusCode}). Pastikan backend di server sudah di-build & restart.',
-            ),
-            backgroundColor: Colors.redAccent,
-            behavior: SnackBarBehavior.floating,
-            duration: const Duration(seconds: 3),
-          ),
+        AppNotification.error(
+          context,
+          'Gagal update database (HTTP ${response.statusCode}).',
         );
       }
     } catch (e) {
       debugPrint('Error updating shelter name to database: $e');
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Gagal koneksi ke server: $e'),
-            backgroundColor: Colors.redAccent,
-            behavior: SnackBarBehavior.floating,
-            duration: const Duration(seconds: 3),
-          ),
-        );
+        AppNotification.error(context, 'Gagal koneksi ke server: $e');
       }
     }
   }
@@ -678,11 +1485,30 @@ class _DashboardTabState extends State<DashboardTab> {
   }
 
   Future<void> _fetchHistory(String sensorType) async {
-    setState(() => isLoadingHistory = true);
+    final reqId = ++_historyRequestId;
+    final targetShelterId = currentShelterId;
+
+    setState(() {
+      isLoadingHistory = true;
+      historySpots = [];
+      historyTimeLabels = [];
+      historyFullDateLabels = [];
+    });
+
+    if (targetShelterId.isEmpty) {
+      if (mounted) setState(() => isLoadingHistory = false);
+      return;
+    }
+
     try {
       final response = await http.get(
-        AppConfig.sensorHistory(sensorType, currentShelterId, limit: 24),
+        AppConfig.sensorHistory(sensorType, targetShelterId, limit: 24),
       );
+
+      if (reqId != _historyRequestId || targetShelterId != currentShelterId) {
+        return;
+      }
+
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
         final List<dynamic> history = data['history'] ?? [];
@@ -782,6 +1608,7 @@ class _DashboardTabState extends State<DashboardTab> {
                   sensorValues[k.toString()] = v.toString();
                 });
               });
+              _triggerAlarmSoundIfNeeded();
             }
           } catch (e) {
             print('WS Parse Error: $e');
@@ -823,6 +1650,67 @@ class _DashboardTabState extends State<DashboardTab> {
     } catch (e) {
       print('WS publish error: $e');
     }
+  }
+
+  Future<void> _fetchThresholds() async {
+    if (currentShelterId.isEmpty) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final cached = prefs.getString('thresholds_$currentShelterId');
+      if (cached != null && cached.isNotEmpty) {
+        try {
+          final List<dynamic> dec = jsonDecode(cached);
+          final map = <String, SensorThreshold>{};
+          for (final item in dec) {
+            final t = SensorThreshold.fromJson(item);
+            map[t.sensorKey] = t;
+          }
+          if (mounted && map.isNotEmpty) {
+            setState(() => sensorThresholds = map);
+          }
+        } catch (_) {}
+      }
+
+      final res = await http
+          .get(AppConfig.sensorThresholds(shelterId: currentShelterId))
+          .timeout(const Duration(seconds: 5));
+      if (res.statusCode == 200 && mounted) {
+        final data = jsonDecode(res.body);
+        if (data['audio_alarm'] != null) {
+          final serverAudio =
+              data['audio_alarm'] == true || data['audio_alarm'] == 1;
+          isAudioAlarmEnabled = serverAudio;
+          await prefs.setBool('audio_alarm_enabled', serverAudio);
+        }
+        final List<dynamic> list = data['thresholds'] ?? [];
+        final map = <String, SensorThreshold>{};
+        for (final item in list) {
+          final t = SensorThreshold.fromJson(item);
+          map[t.sensorKey] = t;
+        }
+        await prefs.setString('thresholds_$currentShelterId', jsonEncode(list));
+        setState(() {
+          sensorThresholds = map;
+        });
+        _triggerAlarmSoundIfNeeded();
+      }
+    } catch (e) {
+      debugPrint('Error fetching thresholds: $e');
+    }
+  }
+
+  void _showAlarmSettingsDialog() {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => SensorAlarmSettingsDialog(
+        shelterId: currentShelterId,
+        shelterName: appTitle,
+        onSaved: () {
+          _fetchThresholds();
+        },
+      ),
+    );
   }
 
   void _showEditAppTitleDialog() {
@@ -1325,23 +2213,17 @@ class _DashboardTabState extends State<DashboardTab> {
                     final unit = unitController.text.trim();
 
                     if (name.isEmpty || key.isEmpty) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(
-                          content: Text(
-                            'Nama dan MQTT Key tidak boleh kosong!',
-                          ),
-                        ),
+                      AppNotification.warning(
+                        context,
+                        'Nama dan MQTT Key tidak boleh kosong!',
                       );
                       return;
                     }
 
                     if (sensors.any((s) => s.key == key)) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(
-                          content: Text(
-                            'MQTT Key sudah digunakan sensor lain!',
-                          ),
-                        ),
+                      AppNotification.warning(
+                        context,
+                        'MQTT Key sudah digunakan sensor lain!',
                       );
                       return;
                     }
@@ -1461,7 +2343,15 @@ class _DashboardTabState extends State<DashboardTab> {
   }
 
   @override
+  void deactivate() {
+    _audioPlayer.stop();
+    super.deactivate();
+  }
+
+  @override
   void dispose() {
+    _audioPlayer.stop();
+    _audioPlayer.dispose();
     _disconnectWebSocket();
     super.dispose();
   }
@@ -1530,7 +2420,94 @@ class _DashboardTabState extends State<DashboardTab> {
               ),
             ],
           ),
-          const SizedBox(height: 24),
+          const SizedBox(height: 16),
+
+          if (activeAlarmCount > 0) ...[
+            Container(
+              margin: const EdgeInsets.only(bottom: 16),
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+              decoration: BoxDecoration(
+                color: Colors.redAccent.withValues(alpha: 0.18),
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(
+                  color: Colors.redAccent.withValues(alpha: 0.7),
+                  width: 1.2,
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.redAccent.withValues(alpha: 0.3),
+                    blurRadius: 12,
+                    spreadRadius: 1,
+                  ),
+                ],
+              ),
+              child: Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: Colors.redAccent.withValues(alpha: 0.25),
+                      shape: BoxShape.circle,
+                    ),
+                    child: const Icon(
+                      Icons.warning_amber_rounded,
+                      color: Colors.redAccent,
+                      size: 20,
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'PERINGATAN: $activeAlarmCount PARAMETER OUT-OF-RANGE',
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.bold,
+                            fontSize: 12.5,
+                            letterSpacing: 0.3,
+                          ),
+                        ),
+                        const SizedBox(height: 2),
+                        const Text(
+                          'Nilai sensor berada di luar batas aman yang ditentukan!',
+                          style: TextStyle(color: Colors.white70, fontSize: 11),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  TextButton(
+                    onPressed: _showAlarmSettingsDialog,
+                    style: TextButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 6,
+                      ),
+                      backgroundColor: Colors.redAccent.withValues(alpha: 0.25),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(8),
+                        side: BorderSide(
+                          color: Colors.redAccent.withValues(alpha: 0.5),
+                        ),
+                      ),
+                    ),
+                    child: const Text(
+                      'Setting',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 11,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ] else ...[
+            const SizedBox(height: 8),
+          ],
 
           // SECTION 1: PRIMARY FIXED SENSORS (HERO CARDS - NH4 & O2)
           Row(
@@ -1566,6 +2543,8 @@ class _DashboardTabState extends State<DashboardTab> {
                   icon: nh4.icon,
                   color: nh4.color,
                   isSelected: _selectedSensorKey == nh4.key,
+                  isAlarm: getAlarmState(nh4.key, nh4Val).isAlarm,
+                  alarmMessage: getAlarmState(nh4.key, nh4Val).message,
                   onTap: () {
                     setState(() => _selectedSensorKey = nh4.key);
                     _fetchHistory(nh4.key);
@@ -1581,6 +2560,8 @@ class _DashboardTabState extends State<DashboardTab> {
                   icon: o2.icon,
                   color: o2.color,
                   isSelected: _selectedSensorKey == o2.key,
+                  isAlarm: getAlarmState(o2.key, o2Val).isAlarm,
+                  alarmMessage: getAlarmState(o2.key, o2Val).message,
                   onTap: () {
                     setState(() => _selectedSensorKey = o2.key);
                     _fetchHistory(o2.key);
@@ -1632,7 +2613,7 @@ class _DashboardTabState extends State<DashboardTab> {
               crossAxisCount: 2,
               crossAxisSpacing: 10,
               mainAxisSpacing: 10,
-              childAspectRatio: 2.3,
+              childAspectRatio: 2.05,
             ),
             itemCount: others.length + 1,
             itemBuilder: (context, index) {
@@ -1642,6 +2623,7 @@ class _DashboardTabState extends State<DashboardTab> {
               final s = others[index];
               final isSelected = _selectedSensorKey == s.key;
               final rawVal = sensorValues[s.key];
+              final sAlarm = getAlarmState(s.key, rawVal);
 
               return CompactSensorCard(
                 title: s.title,
@@ -1651,6 +2633,8 @@ class _DashboardTabState extends State<DashboardTab> {
                 color: s.color,
                 isDefault: s.isDefault,
                 isSelected: isSelected,
+                isAlarm: sAlarm.isAlarm,
+                alarmMessage: sAlarm.message,
                 onTap: () {
                   setState(() => _selectedSensorKey = s.key);
                   _fetchHistory(s.key);
@@ -1994,14 +2978,14 @@ class _DashboardTabState extends State<DashboardTab> {
                                                   historyFullDateLabels.length)
                                           ? historyFullDateLabels[idx]
                                           : ((idx >= 0 &&
-                                                  idx <
-                                                      historyTimeLabels.length)
-                                              ? historyTimeLabels[idx]
-                                              : '');
-                                      String formattedVal =
-                                          spot.y >= 10
-                                              ? spot.y.toStringAsFixed(1)
-                                              : spot.y.toStringAsFixed(2);
+                                                    idx <
+                                                        historyTimeLabels
+                                                            .length)
+                                                ? historyTimeLabels[idx]
+                                                : '');
+                                      String formattedVal = spot.y >= 10
+                                          ? spot.y.toStringAsFixed(1)
+                                          : spot.y.toStringAsFixed(2);
                                       return LineTooltipItem(
                                         '$formattedVal ${selectedSensor.unit}\n$dateTime',
                                         const TextStyle(
@@ -2025,19 +3009,15 @@ class _DashboardTabState extends State<DashboardTab> {
                                   isStrokeCapRound: true,
                                   dotData: FlDotData(
                                     show: historySpots.length <= 25,
-                                    getDotPainter: (
-                                      spot,
-                                      percent,
-                                      barData,
-                                      index,
-                                    ) {
-                                      return FlDotCirclePainter(
-                                        radius: 3.5,
-                                        color: selectedSensor.color,
-                                        strokeWidth: 1.5,
-                                        strokeColor: Colors.white,
-                                      );
-                                    },
+                                    getDotPainter:
+                                        (spot, percent, barData, index) {
+                                          return FlDotCirclePainter(
+                                            radius: 3.5,
+                                            color: selectedSensor.color,
+                                            strokeWidth: 1.5,
+                                            strokeColor: Colors.white,
+                                          );
+                                        },
                                   ),
                                   belowBarData: BarAreaData(
                                     show: true,
@@ -2101,6 +3081,8 @@ class LargeHeroSensorCard extends StatelessWidget {
   final IconData icon;
   final Color color;
   final bool isSelected;
+  final bool isAlarm;
+  final String? alarmMessage;
   final VoidCallback? onTap;
 
   const LargeHeroSensorCard({
@@ -2111,6 +3093,8 @@ class LargeHeroSensorCard extends StatelessWidget {
     required this.icon,
     required this.color,
     this.isSelected = false,
+    this.isAlarm = false,
+    this.alarmMessage,
     this.onTap,
   });
 
@@ -2127,35 +3111,51 @@ class LargeHeroSensorCard extends StatelessWidget {
             padding: const EdgeInsets.all(16),
             decoration: BoxDecoration(
               gradient: LinearGradient(
-                colors: isSelected
+                colors: isAlarm
                     ? [
-                        color.withValues(alpha: 0.35),
-                        color.withValues(alpha: 0.15),
+                        Colors.redAccent.withValues(alpha: 0.30),
+                        Colors.red.withValues(alpha: 0.12),
                       ]
-                    : [
-                        Colors.white.withValues(alpha: 0.14),
-                        Colors.white.withValues(alpha: 0.06),
-                      ],
+                    : (isSelected
+                          ? [
+                              color.withValues(alpha: 0.35),
+                              color.withValues(alpha: 0.15),
+                            ]
+                          : [
+                              Colors.white.withValues(alpha: 0.14),
+                              Colors.white.withValues(alpha: 0.06),
+                            ]),
                 begin: Alignment.topLeft,
                 end: Alignment.bottomRight,
               ),
               borderRadius: BorderRadius.circular(22),
               border: Border.all(
-                color: isSelected
-                    ? color
-                    : Colors.white.withValues(alpha: 0.22),
-                width: isSelected ? 2.2 : 1.2,
+                color: isAlarm
+                    ? Colors.redAccent
+                    : (isSelected
+                          ? color
+                          : Colors.white.withValues(alpha: 0.22)),
+                width: isAlarm ? 2.2 : (isSelected ? 2.2 : 1.2),
               ),
-              boxShadow: isSelected
+              boxShadow: isAlarm
                   ? [
                       BoxShadow(
-                        color: color.withValues(alpha: 0.25),
-                        blurRadius: 16,
-                        spreadRadius: 1,
+                        color: Colors.redAccent.withValues(alpha: 0.4),
+                        blurRadius: 18,
+                        spreadRadius: 2,
                         offset: const Offset(0, 4),
                       ),
                     ]
-                  : null,
+                  : (isSelected
+                        ? [
+                            BoxShadow(
+                              color: color.withValues(alpha: 0.25),
+                              blurRadius: 16,
+                              spreadRadius: 1,
+                              offset: const Offset(0, 4),
+                            ),
+                          ]
+                        : null),
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -2167,45 +3167,85 @@ class LargeHeroSensorCard extends StatelessWidget {
                     Container(
                       padding: const EdgeInsets.all(8),
                       decoration: BoxDecoration(
-                        color: color.withValues(alpha: 0.2),
+                        color: (isAlarm ? Colors.redAccent : color).withValues(
+                          alpha: 0.2,
+                        ),
                         shape: BoxShape.circle,
                         border: Border.all(
-                          color: color.withValues(alpha: 0.5),
+                          color: (isAlarm ? Colors.redAccent : color)
+                              .withValues(alpha: 0.5),
                           width: 1.2,
                         ),
                       ),
-                      child: Icon(icon, size: 22, color: color),
-                    ),
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 7,
-                        vertical: 3,
+                      child: Icon(
+                        icon,
+                        size: 22,
+                        color: isAlarm ? Colors.redAccent : color,
                       ),
-                      decoration: BoxDecoration(
-                        color: color.withValues(alpha: 0.15),
-                        borderRadius: BorderRadius.circular(12),
-                        border: Border.all(
-                          color: color.withValues(alpha: 0.4),
-                          width: 1,
+                    ),
+                    if (isAlarm)
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 7,
+                          vertical: 3,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.redAccent.withValues(alpha: 0.25),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: Colors.redAccent, width: 1),
+                        ),
+                        child: const Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              Icons.warning_amber_rounded,
+                              size: 11,
+                              color: Colors.redAccent,
+                            ),
+                            SizedBox(width: 3),
+                            Text(
+                              'ALARM',
+                              style: TextStyle(
+                                color: Colors.redAccent,
+                                fontSize: 9,
+                                fontWeight: FontWeight.bold,
+                                letterSpacing: 0.4,
+                              ),
+                            ),
+                          ],
+                        ),
+                      )
+                    else
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 7,
+                          vertical: 3,
+                        ),
+                        decoration: BoxDecoration(
+                          color: color.withValues(alpha: 0.15),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(
+                            color: color.withValues(alpha: 0.4),
+                            width: 1,
+                          ),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(Icons.lock_rounded, size: 10, color: color),
+                            const SizedBox(width: 3),
+                            Text(
+                              'FIXED',
+                              style: TextStyle(
+                                color: color,
+                                fontSize: 9,
+                                fontWeight: FontWeight.bold,
+                                letterSpacing: 0.5,
+                              ),
+                            ),
+                          ],
                         ),
                       ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(Icons.lock_rounded, size: 10, color: color),
-                          const SizedBox(width: 3),
-                          Text(
-                            'FIXED',
-                            style: TextStyle(
-                              color: color,
-                              fontSize: 9,
-                              fontWeight: FontWeight.bold,
-                              letterSpacing: 0.5,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
                   ],
                 ),
                 const SizedBox(height: 14),
@@ -2222,13 +3262,17 @@ class LargeHeroSensorCard extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.baseline,
                   textBaseline: TextBaseline.alphabetic,
                   children: [
-                    Text(
-                      value,
-                      style: const TextStyle(
-                        fontSize: 28,
-                        fontWeight: FontWeight.w900,
-                        color: Colors.white,
-                        letterSpacing: -0.5,
+                    Flexible(
+                      child: Text(
+                        value,
+                        style: const TextStyle(
+                          fontSize: 28,
+                          fontWeight: FontWeight.w900,
+                          color: Colors.white,
+                          letterSpacing: -0.5,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
                       ),
                     ),
                     if (unit.isNotEmpty) ...[
@@ -2244,6 +3288,46 @@ class LargeHeroSensorCard extends StatelessWidget {
                     ],
                   ],
                 ),
+                if (isAlarm && alarmMessage != null) ...[
+                  const SizedBox(height: 6),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 6,
+                      vertical: 2.5,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.redAccent.withValues(alpha: 0.20),
+                      borderRadius: BorderRadius.circular(6),
+                      border: Border.all(
+                        color: Colors.redAccent.withValues(alpha: 0.5),
+                        width: 0.8,
+                      ),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(
+                          Icons.warning_amber_rounded,
+                          size: 11,
+                          color: Colors.redAccent,
+                        ),
+                        const SizedBox(width: 3),
+                        Flexible(
+                          child: Text(
+                            alarmMessage!,
+                            style: const TextStyle(
+                              fontSize: 9.5,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.redAccent,
+                            ),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
               ],
             ),
           ),
@@ -2261,6 +3345,8 @@ class CompactSensorCard extends StatelessWidget {
   final Color color;
   final bool isDefault;
   final bool isSelected;
+  final bool isAlarm;
+  final String? alarmMessage;
   final VoidCallback? onTap;
   final VoidCallback? onLongPress;
 
@@ -2273,6 +3359,8 @@ class CompactSensorCard extends StatelessWidget {
     required this.color,
     this.isDefault = true,
     this.isSelected = false,
+    this.isAlarm = false,
+    this.alarmMessage,
     this.onTap,
     this.onLongPress,
   });
@@ -2288,85 +3376,123 @@ class CompactSensorCard extends StatelessWidget {
           filter: ImageFilter.blur(sigmaX: 8, sigmaY: 8),
           child: AnimatedContainer(
             duration: const Duration(milliseconds: 250),
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
             decoration: BoxDecoration(
-              color: isSelected
-                  ? color.withValues(alpha: 0.22)
-                  : Colors.white.withValues(alpha: 0.08),
+              color: isAlarm
+                  ? Colors.redAccent.withValues(alpha: 0.20)
+                  : (isSelected
+                        ? color.withValues(alpha: 0.22)
+                        : Colors.white.withValues(alpha: 0.08)),
               borderRadius: BorderRadius.circular(14),
               border: Border.all(
-                color: isSelected
-                    ? color
-                    : Colors.white.withValues(alpha: 0.16),
-                width: isSelected ? 1.8 : 1.0,
+                color: isAlarm
+                    ? Colors.redAccent
+                    : (isSelected
+                          ? color
+                          : Colors.white.withValues(alpha: 0.16)),
+                width: isAlarm ? 1.8 : (isSelected ? 1.8 : 1.0),
               ),
-              boxShadow: isSelected
+              boxShadow: isAlarm
                   ? [
                       BoxShadow(
-                        color: color.withValues(alpha: 0.2),
-                        blurRadius: 8,
+                        color: Colors.redAccent.withValues(alpha: 0.35),
+                        blurRadius: 10,
                         spreadRadius: 1,
                       ),
                     ]
-                  : null,
+                  : (isSelected
+                        ? [
+                            BoxShadow(
+                              color: color.withValues(alpha: 0.2),
+                              blurRadius: 8,
+                              spreadRadius: 1,
+                            ),
+                          ]
+                        : null),
             ),
             child: Row(
               children: [
                 Container(
                   padding: const EdgeInsets.all(6),
                   decoration: BoxDecoration(
-                    color: color.withValues(alpha: 0.18),
+                    color: (isAlarm ? Colors.redAccent : color).withValues(
+                      alpha: 0.18,
+                    ),
                     borderRadius: BorderRadius.circular(8),
                     border: Border.all(
-                      color: color.withValues(alpha: 0.35),
+                      color: (isAlarm ? Colors.redAccent : color).withValues(
+                        alpha: 0.4,
+                      ),
                       width: 1,
                     ),
                   ),
-                  child: Icon(icon, size: 16, color: color),
+                  child: Icon(
+                    icon,
+                    size: 16,
+                    color: isAlarm ? Colors.redAccent : color,
+                  ),
                 ),
                 const SizedBox(width: 8),
                 Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Text(
-                        title,
-                        style: const TextStyle(
-                          fontSize: 11,
-                          fontWeight: FontWeight.w600,
-                          color: Colors.white70,
-                        ),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                      const SizedBox(height: 2),
-                      Row(
-                        crossAxisAlignment: CrossAxisAlignment.baseline,
-                        textBaseline: TextBaseline.alphabetic,
-                        children: [
-                          Text(
-                            value,
-                            style: const TextStyle(
-                              fontSize: 16,
-                              fontWeight: FontWeight.w800,
-                              color: Colors.white,
-                            ),
+                  child: FittedBox(
+                    fit: BoxFit.scaleDown,
+                    alignment: Alignment.centerLeft,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          title,
+                          style: const TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w600,
+                            color: Colors.white70,
                           ),
-                          if (unit.isNotEmpty) ...[
-                            const SizedBox(width: 2),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        const SizedBox(height: 1.5),
+                        Row(
+                          crossAxisAlignment: CrossAxisAlignment.baseline,
+                          textBaseline: TextBaseline.alphabetic,
+                          children: [
                             Text(
-                              unit,
-                              style: TextStyle(
-                                fontSize: 10,
-                                fontWeight: FontWeight.bold,
-                                color: color,
+                              value,
+                              style: const TextStyle(
+                                fontSize: 16,
+                                fontWeight: FontWeight.w800,
+                                color: Colors.white,
                               ),
                             ),
+                            if (unit.isNotEmpty) ...[
+                              const SizedBox(width: 2),
+                              Text(
+                                unit,
+                                style: TextStyle(
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.bold,
+                                  color: color,
+                                ),
+                              ),
+                            ],
                           ],
+                        ),
+                        if (isAlarm) ...[
+                          const SizedBox(height: 1),
+                          Text(
+                            '⚠️ ${alarmMessage ?? "ALARM"}',
+                            style: const TextStyle(
+                              fontSize: 8.5,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.redAccent,
+                            ),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
                         ],
-                      ),
-                    ],
+                      ],
+                    ),
                   ),
                 ),
                 if (!isDefault)
@@ -2446,9 +3572,13 @@ class _LocationTabState extends State<LocationTab> {
         );
 
         if (currentShelter != null && mounted) {
-          final dbLat = (currentShelter['latitude'] as num?)?.toDouble() ?? shelterLat;
-          final dbLng = (currentShelter['longitude'] as num?)?.toDouble() ?? shelterLng;
-          final dbRadius = (currentShelter['geofence_radius'] as num?)?.toDouble() ?? thresholdMeters;
+          final dbLat =
+              (currentShelter['latitude'] as num?)?.toDouble() ?? shelterLat;
+          final dbLng =
+              (currentShelter['longitude'] as num?)?.toDouble() ?? shelterLng;
+          final dbRadius =
+              (currentShelter['geofence_radius'] as num?)?.toDouble() ??
+              thresholdMeters;
 
           setState(() {
             shelterLat = dbLat;
@@ -2466,7 +3596,9 @@ class _LocationTabState extends State<LocationTab> {
         }
       }
     } catch (e) {
-      debugPrint('Info: Menggunakan cache lokal geofence (server unreached): $e');
+      debugPrint(
+        'Info: Menggunakan cache lokal geofence (server unreached): $e',
+      );
     }
   }
 
@@ -2503,25 +3635,14 @@ class _LocationTabState extends State<LocationTab> {
           .timeout(const Duration(seconds: 8));
 
       if (response.statusCode == 200 && mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(
-              'Lokasi & radius shelter berhasil disimpan ke database!',
-            ),
-            backgroundColor: Color(0xFF00C853),
-            behavior: SnackBarBehavior.floating,
-            duration: Duration(seconds: 2),
-          ),
+        AppNotification.success(
+          context,
+          'Lokasi & radius shelter berhasil disimpan ke database!',
         );
       } else if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              'Tersimpan di HP, gagal sinkron database (Status: ${response.statusCode})',
-            ),
-            backgroundColor: Colors.orangeAccent,
-            behavior: SnackBarBehavior.floating,
-          ),
+        AppNotification.warning(
+          context,
+          'Tersimpan di HP, gagal sinkron database (Status: ${response.statusCode})',
         );
       }
     } catch (e) {
@@ -3537,10 +4658,12 @@ class ProfileTab extends StatefulWidget {
 class _ProfileTabState extends State<ProfileTab> {
   String _role = 'User';
   String _tenantId = '-';
+  String _email = '';
   String _currentShelterId = 'SHELTER-01';
   String? _profileImagePath;
   String? _serverAvatarUrl;
   bool _isUploadingAvatar = false;
+  bool _isDeletingAccount = false;
   List<ShelterData> _shelters = [];
   bool _isLoading = true;
 
@@ -3556,18 +4679,23 @@ class _ProfileTabState extends State<ProfileTab> {
     final savedTenant = prefs.getString('tenant_id') ?? '-';
     final savedShelterId =
         prefs.getString('current_shelter_id') ?? 'SHELTER-01';
-    final savedImagePath =
-        prefs.getString('profile_image_${widget.username}');
-    final savedServerAvatar =
-        prefs.getString('profile_image_server_${widget.username}');
+    final savedEmail = prefs.getString('email') ?? '';
+    final savedImagePath = prefs.getString('profile_image_${widget.username}');
+    final savedServerAvatar = prefs.getString(
+      'profile_image_server_${widget.username}',
+    );
+
+    String resolvedEmail = savedEmail;
+    if (resolvedEmail.isEmpty && widget.username.contains('@')) {
+      resolvedEmail = widget.username;
+    }
 
     List<ShelterData> loadedShelters = [];
     final savedSheltersJson = prefs.getString('available_shelters');
     if (savedSheltersJson != null && savedSheltersJson.isNotEmpty) {
       try {
         final List<dynamic> decoded = jsonDecode(savedSheltersJson);
-        loadedShelters =
-            decoded.map((e) => ShelterData.fromJson(e)).toList();
+        loadedShelters = decoded.map((e) => ShelterData.fromJson(e)).toList();
       } catch (e) {
         debugPrint('Error parsing cached shelters in profile: $e');
       }
@@ -3577,6 +4705,7 @@ class _ProfileTabState extends State<ProfileTab> {
       setState(() {
         _role = savedRole;
         _tenantId = savedTenant;
+        _email = resolvedEmail;
         _currentShelterId = savedShelterId;
         _profileImagePath = savedImagePath;
         _serverAvatarUrl = savedServerAvatar;
@@ -3585,8 +4714,54 @@ class _ProfileTabState extends State<ProfileTab> {
       });
     }
 
+    // Ambil data profile paling fresh (termasuk email) dari database server
+    _fetchUserProfile();
+
     // Ambil data shelter paling fresh dari database server
     _fetchFreshShelters(savedTenant);
+  }
+
+  Future<void> _fetchUserProfile() async {
+    try {
+      final res = await http
+          .get(AppConfig.userProfile(widget.username))
+          .timeout(const Duration(seconds: 5));
+      if (res.statusCode == 200 && mounted) {
+        final data = jsonDecode(res.body);
+        final freshEmail = data['email']?.toString() ?? '';
+        final freshRole = data['role']?.toString() ?? '';
+        final freshTenant = data['tenant_id']?.toString() ?? '';
+        final freshAvatar = data['foto_profile']?.toString();
+
+        final prefs = await SharedPreferences.getInstance();
+        if (freshEmail.isNotEmpty) {
+          await prefs.setString('email', freshEmail);
+        }
+        if (freshRole.isNotEmpty) {
+          await prefs.setString('user_role', freshRole);
+        }
+        if (freshTenant.isNotEmpty) {
+          await prefs.setString('tenant_id', freshTenant);
+        }
+        if (freshAvatar != null && freshAvatar.isNotEmpty) {
+          await prefs.setString(
+            'profile_image_server_${widget.username}',
+            freshAvatar,
+          );
+        }
+
+        if (mounted) {
+          setState(() {
+            if (freshEmail.isNotEmpty) _email = freshEmail;
+            if (freshRole.isNotEmpty) _role = freshRole;
+            if (freshTenant.isNotEmpty) _tenantId = freshTenant;
+            if (freshAvatar != null && freshAvatar.isNotEmpty) {
+              _serverAvatarUrl = freshAvatar;
+            }
+          });
+        }
+      }
+    } catch (_) {}
   }
 
   Future<void> _fetchFreshShelters(String tenantId) async {
@@ -3594,14 +4769,12 @@ class _ProfileTabState extends State<ProfileTab> {
       final uri = AppConfig.shelters(
         tenantId: (tenantId.isNotEmpty && tenantId != '-') ? tenantId : null,
       );
-      final response =
-          await http.get(uri).timeout(const Duration(seconds: 6));
+      final response = await http.get(uri).timeout(const Duration(seconds: 6));
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
         if (data['shelters'] != null) {
           final List<dynamic> list = data['shelters'];
-          final updated =
-              list.map((e) => ShelterData.fromJson(e)).toList();
+          final updated = list.map((e) => ShelterData.fromJson(e)).toList();
           final prefs = await SharedPreferences.getInstance();
           await prefs.setString('available_shelters', jsonEncode(list));
           if (mounted) {
@@ -3675,8 +4848,9 @@ class _ProfileTabState extends State<ProfileTab> {
           req.files.add(
             await http.MultipartFile.fromPath('avatar', pickedFile.path),
           );
-          final streamed =
-              await req.send().timeout(const Duration(seconds: 12));
+          final streamed = await req.send().timeout(
+            const Duration(seconds: 12),
+          );
           final res = await http.Response.fromStream(streamed);
 
           if (res.statusCode == 200) {
@@ -3694,28 +4868,17 @@ class _ProfileTabState extends State<ProfileTab> {
               }
             }
             if (mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                  content: Text(
-                    'Foto profil berhasil diperbarui & tersimpan di server!',
-                  ),
-                  backgroundColor: Color(0xFF00C853),
-                  behavior: SnackBarBehavior.floating,
-                  duration: Duration(seconds: 2),
-                ),
+              AppNotification.success(
+                context,
+                'Foto profil berhasil diperbarui & tersimpan di server!',
               );
             }
           } else {
             debugPrint('Server upload avatar status: ${res.statusCode}');
             if (mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(
-                  content: Text(
-                    'Foto tersimpan lokal (Upload server: HTTP ${res.statusCode})',
-                  ),
-                  backgroundColor: Colors.orangeAccent,
-                  behavior: SnackBarBehavior.floating,
-                ),
+              AppNotification.warning(
+                context,
+                'Foto tersimpan lokal (Upload server: HTTP ${res.statusCode})',
               );
             }
           }
@@ -3732,13 +4895,7 @@ class _ProfileTabState extends State<ProfileTab> {
     } catch (e) {
       debugPrint('Error picking profile image: $e');
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Gagal memilih foto: $e'),
-            backgroundColor: Colors.redAccent,
-            behavior: SnackBarBehavior.floating,
-          ),
-        );
+        AppNotification.error(context, 'Gagal memilih foto: $e');
       }
     }
   }
@@ -3753,14 +4910,7 @@ class _ProfileTabState extends State<ProfileTab> {
         _profileImagePath = null;
         _serverAvatarUrl = null;
       });
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Foto profil dikembalikan ke default.'),
-          backgroundColor: Colors.orangeAccent,
-          behavior: SnackBarBehavior.floating,
-          duration: Duration(seconds: 2),
-        ),
-      );
+      AppNotification.info(context, 'Foto profil dikembalikan ke default.');
     }
 
     // Hapus di server database
@@ -3877,6 +5027,22 @@ class _ProfileTabState extends State<ProfileTab> {
     );
   }
 
+  void _openAlarmSettings() {
+    final activeShelter = _shelters.firstWhere(
+      (s) => s.id == _currentShelterId,
+      orElse: () => ShelterData(id: _currentShelterId, name: _currentShelterId),
+    );
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => SensorAlarmSettingsDialog(
+        shelterId: _currentShelterId,
+        shelterName: activeShelter.name,
+      ),
+    );
+  }
+
   void _confirmLogout() {
     showDialog(
       context: context,
@@ -3907,13 +5073,22 @@ class _ProfileTabState extends State<ProfileTab> {
               Navigator.pop(ctx);
               final prefs = await SharedPreferences.getInstance();
               await prefs.remove('username');
+              await prefs.remove('email');
+              await prefs.remove('user_role');
+              await prefs.remove('tenant_id');
+              await prefs.remove('current_shelter_id');
+              await prefs.remove('available_shelters');
+              await prefs.remove('app_title');
+              await prefs.remove('app_subtitle');
+              await prefs.remove('shelter_lat');
+              await prefs.remove('shelter_lng');
+              await prefs.remove('shelter_radius');
+              await prefs.remove('shelter_radius_m');
 
               if (!mounted) return;
               Navigator.pushReplacement(
                 context,
-                MaterialPageRoute(
-                  builder: (context) => const LoginPage(),
-                ),
+                MaterialPageRoute(builder: (context) => const LoginPage()),
               );
             },
             style: ElevatedButton.styleFrom(
@@ -3930,520 +5105,1068 @@ class _ProfileTabState extends State<ProfileTab> {
     );
   }
 
+  void _confirmDeleteAccount() {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1E293B),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: const Row(
+          children: [
+            Icon(
+              Icons.warning_amber_rounded,
+              color: Colors.redAccent,
+              size: 28,
+            ),
+            SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                'Hapus Akun Permanen?',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Apakah Anda yakin ingin menghapus akun "${widget.username}" secara permanen?',
+              style: const TextStyle(color: Colors.white70, fontSize: 14),
+            ),
+            const SizedBox(height: 12),
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.redAccent.withValues(alpha: 0.15),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(
+                  color: Colors.redAccent.withValues(alpha: 0.3),
+                ),
+              ),
+              child: const Row(
+                children: [
+                  Icon(Icons.info_outline, color: Colors.redAccent, size: 18),
+                  SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'Tindakan ini tidak dapat dibatalkan. Semua data profil dan akses Anda akan dihapus.',
+                      style: TextStyle(color: Colors.redAccent, fontSize: 12),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Batal', style: TextStyle(color: Colors.white60)),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              Navigator.pop(ctx);
+              _deleteAccount();
+            },
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.redAccent,
+              foregroundColor: Colors.white,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(10),
+              ),
+            ),
+            child: const Text('Ya, Hapus Akun'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _showAccountDeletedSuccessDialog() async {
+    await showGeneralDialog(
+      context: context,
+      barrierDismissible: false,
+      barrierLabel: 'AccountDeleted',
+      barrierColor: Colors.black.withValues(alpha: 0.8),
+      transitionDuration: const Duration(milliseconds: 450),
+      pageBuilder: (ctx, anim1, anim2) => const SizedBox.shrink(),
+      transitionBuilder: (dialogCtx, anim1, anim2, child) {
+        final curvedScale = Curves.easeOutBack.transform(anim1.value);
+        return BackdropFilter(
+          filter: ImageFilter.blur(
+            sigmaX: 8 * anim1.value,
+            sigmaY: 8 * anim1.value,
+          ),
+          child: Transform.scale(
+            scale: curvedScale.clamp(0.0, 1.2),
+            child: Opacity(
+              opacity: anim1.value.clamp(0.0, 1.0),
+              child: Center(
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 28),
+                  child: Material(
+                    color: Colors.transparent,
+                    child: Container(
+                      padding: const EdgeInsets.all(28),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF0F1E36),
+                        borderRadius: BorderRadius.circular(28),
+                        border: Border.all(
+                          color: const Color(0xFF00E5FF)
+                              .withValues(alpha: 0.35),
+                          width: 1.5,
+                        ),
+                        boxShadow: [
+                          BoxShadow(
+                            color: const Color(0xFF00E5FF)
+                                .withValues(alpha: 0.2),
+                            blurRadius: 36,
+                            spreadRadius: 4,
+                          ),
+                          BoxShadow(
+                            color: Colors.black.withValues(alpha: 0.6),
+                            blurRadius: 20,
+                            offset: const Offset(0, 10),
+                          ),
+                        ],
+                      ),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          // Animated Glowing Success Icon
+                          TweenAnimationBuilder<double>(
+                            tween: Tween(begin: 0.0, end: 1.0),
+                            duration: const Duration(milliseconds: 600),
+                            curve: Curves.elasticOut,
+                            builder: (context, scale, child) {
+                              return Transform.scale(
+                                scale: scale,
+                                child: Stack(
+                                  alignment: Alignment.center,
+                                  children: [
+                                    Container(
+                                      width: 88,
+                                      height: 88,
+                                      decoration: BoxDecoration(
+                                        shape: BoxShape.circle,
+                                        gradient: RadialGradient(
+                                          colors: [
+                                            const Color(0xFF00E676)
+                                                .withValues(alpha: 0.35),
+                                            Colors.transparent,
+                                          ],
+                                          stops: const [0.4, 1.0],
+                                        ),
+                                      ),
+                                    ),
+                                    Container(
+                                      width: 68,
+                                      height: 68,
+                                      decoration: BoxDecoration(
+                                        shape: BoxShape.circle,
+                                        gradient: const LinearGradient(
+                                          colors: [
+                                            Color(0xFF00E676),
+                                            Color(0xFF00B0FF),
+                                          ],
+                                          begin: Alignment.topLeft,
+                                          end: Alignment.bottomRight,
+                                        ),
+                                        boxShadow: [
+                                          BoxShadow(
+                                            color: const Color(0xFF00E676)
+                                                .withValues(alpha: 0.5),
+                                            blurRadius: 20,
+                                            spreadRadius: 2,
+                                          ),
+                                        ],
+                                      ),
+                                      child: const Icon(
+                                        Icons.check_rounded,
+                                        color: Colors.white,
+                                        size: 40,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              );
+                            },
+                          ),
+                          const SizedBox(height: 20),
+
+                          // Title
+                          const Text(
+                            'Akun Berhasil Dihapus',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                              fontSize: 20,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.white,
+                              letterSpacing: 0.4,
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+
+                          // Description
+                          const Text(
+                            'Akun dan seluruh data profil Anda telah berhasil dihapus secara permanen dari server Smart Shelter.',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                              fontSize: 13,
+                              color: Colors.white70,
+                              height: 1.5,
+                            ),
+                          ),
+                          const SizedBox(height: 20),
+
+                          // Status Pill Container
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 14,
+                              vertical: 10,
+                            ),
+                            decoration: BoxDecoration(
+                              color: Colors.white.withValues(alpha: 0.05),
+                              borderRadius: BorderRadius.circular(14),
+                              border: Border.all(
+                                color: Colors.white.withValues(alpha: 0.1),
+                              ),
+                            ),
+                            child: const Row(
+                              children: [
+                                Icon(
+                                  Icons.shield_outlined,
+                                  color: Color(0xFF00E5FF),
+                                  size: 20,
+                                ),
+                                SizedBox(width: 10),
+                                Expanded(
+                                  child: Text(
+                                    'Sesi lokal dan token akses telah dibersihkan sepenuhnya.',
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      color: Colors.white60,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(height: 24),
+
+                          // Modern Gradient Confirmation Button
+                          Container(
+                            width: double.infinity,
+                            height: 48,
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(14),
+                              gradient: const LinearGradient(
+                                colors: [Color(0xFF2F80ED), Color(0xFF00E5FF)],
+                                begin: Alignment.centerLeft,
+                                end: Alignment.centerRight,
+                              ),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: const Color(0xFF00E5FF)
+                                      .withValues(alpha: 0.35),
+                                  blurRadius: 14,
+                                  offset: const Offset(0, 4),
+                                ),
+                              ],
+                            ),
+                            child: ElevatedButton(
+                              onPressed: () => Navigator.pop(dialogCtx),
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: Colors.transparent,
+                                shadowColor: Colors.transparent,
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(14),
+                                ),
+                              ),
+                              child: const Row(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: [
+                                  Text(
+                                    'Kembali ke Halaman Masuk',
+                                    style: TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 14,
+                                      fontWeight: FontWeight.bold,
+                                      letterSpacing: 0.3,
+                                    ),
+                                  ),
+                                  SizedBox(width: 8),
+                                  Icon(
+                                    Icons.arrow_forward_rounded,
+                                    size: 18,
+                                    color: Colors.white,
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> _deleteAccount() async {
+    setState(() => _isDeletingAccount = true);
+
+    try {
+      final res = await http
+          .delete(AppConfig.deleteAccount(username: widget.username))
+          .timeout(const Duration(seconds: 8));
+
+      if (res.statusCode == 200 || res.statusCode == 204) {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.clear();
+
+        if (!mounted) return;
+
+        // Tampilkan modal popup animasi modern
+        await _showAccountDeletedSuccessDialog();
+
+        if (!mounted) return;
+        Navigator.pushAndRemoveUntil(
+          context,
+          MaterialPageRoute(builder: (context) => const LoginPage()),
+          (route) => false,
+        );
+        return;
+      } else {
+        String errorMsg = 'Gagal menghapus akun.';
+        try {
+          final data = jsonDecode(res.body);
+          if (data['detail'] != null) errorMsg = data['detail'];
+        } catch (_) {}
+
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(errorMsg),
+            backgroundColor: Colors.redAccent,
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Gagal menghapus akun: $e'),
+          backgroundColor: Colors.redAccent,
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _isDeletingAccount = false);
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final displayRole = _role.isNotEmpty
         ? (_role.toLowerCase() == 'admin'
-            ? 'Administrator'
-            : _role[0].toUpperCase() + _role.substring(1))
+              ? 'Administrator'
+              : _role[0].toUpperCase() + _role.substring(1))
         : 'User';
 
     return SingleChildScrollView(
       physics: const BouncingScrollPhysics(),
-      padding: const EdgeInsets.fromLTRB(20, 16, 20, 110),
+      padding: const EdgeInsets.fromLTRB(20, 16, 20, 130),
       child: Column(
-          children: [
-            // --- KARTU PROFIL UTAMA (Glassmorphic) ---
-            ClipRRect(
-              borderRadius: BorderRadius.circular(24),
-              child: BackdropFilter(
-                filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
-                child: Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 24,
-                    vertical: 28,
+        children: [
+          // --- KARTU PROFIL UTAMA (Glassmorphic) ---
+          ClipRRect(
+            borderRadius: BorderRadius.circular(24),
+            child: BackdropFilter(
+              filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+              child: Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 24,
+                  vertical: 28,
+                ),
+                decoration: BoxDecoration(
+                  color: Colors.white.withValues(alpha: 0.12),
+                  borderRadius: BorderRadius.circular(24),
+                  border: Border.all(
+                    color: Colors.white.withValues(alpha: 0.2),
                   ),
-                  decoration: BoxDecoration(
-                    color: Colors.white.withValues(alpha: 0.12),
-                    borderRadius: BorderRadius.circular(24),
-                    border: Border.all(
-                      color: Colors.white.withValues(alpha: 0.2),
+                ),
+                child: Column(
+                  children: [
+                    // Avatar dengan tombol kamera
+                    Stack(
+                      alignment: Alignment.bottomRight,
+                      children: [
+                        GestureDetector(
+                          onTap: () => _showImageSourceActionSheet(context),
+                          child: Container(
+                            width: 108,
+                            height: 108,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              border: Border.all(
+                                color: Colors.cyanAccent.withValues(alpha: 0.6),
+                                width: 2.5,
+                              ),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: Colors.cyanAccent.withValues(
+                                    alpha: 0.25,
+                                  ),
+                                  blurRadius: 16,
+                                  spreadRadius: 2,
+                                ),
+                              ],
+                            ),
+                            child: ClipOval(
+                              child: Stack(
+                                alignment: Alignment.center,
+                                children: [
+                                  if (_profileImagePath != null &&
+                                      File(_profileImagePath!).existsSync())
+                                    Image.file(
+                                      File(_profileImagePath!),
+                                      width: 108,
+                                      height: 108,
+                                      fit: BoxFit.cover,
+                                    )
+                                  else if (_serverAvatarUrl != null &&
+                                      _serverAvatarUrl!.isNotEmpty)
+                                    Image.network(
+                                      AppConfig.avatarUrl(_serverAvatarUrl!),
+                                      width: 108,
+                                      height: 108,
+                                      fit: BoxFit.cover,
+                                      errorBuilder:
+                                          (context, error, stackTrace) =>
+                                              Container(
+                                                decoration: const BoxDecoration(
+                                                  gradient: LinearGradient(
+                                                    colors: [
+                                                      Color(0xFF0072FF),
+                                                      Color(0xFF00C6FF),
+                                                    ],
+                                                    begin: Alignment.topLeft,
+                                                    end: Alignment.bottomRight,
+                                                  ),
+                                                ),
+                                                child: const Icon(
+                                                  Icons.person_rounded,
+                                                  size: 60,
+                                                  color: Colors.white,
+                                                ),
+                                              ),
+                                    )
+                                  else
+                                    Container(
+                                      decoration: const BoxDecoration(
+                                        gradient: LinearGradient(
+                                          colors: [
+                                            Color(0xFF0072FF),
+                                            Color(0xFF00C6FF),
+                                          ],
+                                          begin: Alignment.topLeft,
+                                          end: Alignment.bottomRight,
+                                        ),
+                                      ),
+                                      child: const Icon(
+                                        Icons.person_rounded,
+                                        size: 60,
+                                        color: Colors.white,
+                                      ),
+                                    ),
+                                  if (_isUploadingAvatar)
+                                    Container(
+                                      color: Colors.black45,
+                                      child: const Center(
+                                        child: SizedBox(
+                                          width: 28,
+                                          height: 28,
+                                          child: CircularProgressIndicator(
+                                            color: Colors.cyanAccent,
+                                            strokeWidth: 2.5,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                        // Badge Camera Button
+                        GestureDetector(
+                          onTap: () => _showImageSourceActionSheet(context),
+                          child: Container(
+                            padding: const EdgeInsets.all(7),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF00E5FF),
+                              shape: BoxShape.circle,
+                              border: Border.all(
+                                color: const Color(0xFF0F172A),
+                                width: 2,
+                              ),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: Colors.black.withValues(alpha: 0.3),
+                                  blurRadius: 6,
+                                ),
+                              ],
+                            ),
+                            child: const Icon(
+                              Icons.camera_alt_rounded,
+                              size: 16,
+                              color: Color(0xFF0A192F),
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
-                  ),
-                  child: Column(
-                    children: [
-                      // Avatar dengan tombol kamera
-                      Stack(
-                        alignment: Alignment.bottomRight,
-                        children: [
-                          GestureDetector(
-                            onTap: () => _showImageSourceActionSheet(context),
-                            child: Container(
-                              width: 108,
-                              height: 108,
-                              decoration: BoxDecoration(
-                                shape: BoxShape.circle,
-                                border: Border.all(
-                                  color: Colors.cyanAccent.withValues(alpha: 0.6),
-                                  width: 2.5,
-                                ),
-                                boxShadow: [
-                                  BoxShadow(
-                                    color: Colors.cyanAccent.withValues(alpha: 0.25),
-                                    blurRadius: 16,
-                                    spreadRadius: 2,
-                                  ),
-                                ],
-                              ),
-                              child: ClipOval(
-                                child: Stack(
-                                  alignment: Alignment.center,
-                                  children: [
-                                    if (_profileImagePath != null &&
-                                        File(_profileImagePath!).existsSync())
-                                      Image.file(
-                                        File(_profileImagePath!),
-                                        width: 108,
-                                        height: 108,
-                                        fit: BoxFit.cover,
-                                      )
-                                    else if (_serverAvatarUrl != null &&
-                                        _serverAvatarUrl!.isNotEmpty)
-                                      Image.network(
-                                        AppConfig.avatarUrl(_serverAvatarUrl!),
-                                        width: 108,
-                                        height: 108,
-                                        fit: BoxFit.cover,
-                                        errorBuilder:
-                                            (context, error, stackTrace) =>
-                                                Container(
-                                          decoration: const BoxDecoration(
-                                            gradient: LinearGradient(
-                                              colors: [
-                                                Color(0xFF0072FF),
-                                                Color(0xFF00C6FF),
-                                              ],
-                                              begin: Alignment.topLeft,
-                                              end: Alignment.bottomRight,
-                                            ),
-                                          ),
-                                          child: const Icon(
-                                            Icons.person_rounded,
-                                            size: 60,
-                                            color: Colors.white,
-                                          ),
-                                        ),
-                                      )
-                                    else
-                                      Container(
-                                        decoration: const BoxDecoration(
-                                          gradient: LinearGradient(
-                                            colors: [
-                                              Color(0xFF0072FF),
-                                              Color(0xFF00C6FF),
-                                            ],
-                                            begin: Alignment.topLeft,
-                                            end: Alignment.bottomRight,
-                                          ),
-                                        ),
-                                        child: const Icon(
-                                          Icons.person_rounded,
-                                          size: 60,
-                                          color: Colors.white,
-                                        ),
-                                      ),
-                                    if (_isUploadingAvatar)
-                                      Container(
-                                        color: Colors.black45,
-                                        child: const Center(
-                                          child: SizedBox(
-                                            width: 28,
-                                            height: 28,
-                                            child: CircularProgressIndicator(
-                                              color: Colors.cyanAccent,
-                                              strokeWidth: 2.5,
-                                            ),
-                                          ),
-                                        ),
-                                      ),
-                                  ],
-                                ),
-                              ),
-                            ),
-                          ),
-                          // Badge Camera Button
-                          GestureDetector(
-                            onTap: () => _showImageSourceActionSheet(context),
-                            child: Container(
-                              padding: const EdgeInsets.all(7),
-                              decoration: BoxDecoration(
-                                color: const Color(0xFF00E5FF),
-                                shape: BoxShape.circle,
-                                border: Border.all(
-                                  color: const Color(0xFF0F172A),
-                                  width: 2,
-                                ),
-                                boxShadow: [
-                                  BoxShadow(
-                                    color: Colors.black.withValues(alpha: 0.3),
-                                    blurRadius: 6,
-                                  ),
-                                ],
-                              ),
-                              child: const Icon(
-                                Icons.camera_alt_rounded,
-                                size: 16,
-                                color: Color(0xFF0A192F),
-                              ),
-                            ),
-                          ),
-                        ],
+                    const SizedBox(height: 16),
+
+                    // Username
+                    Text(
+                      widget.username,
+                      style: const TextStyle(
+                        fontSize: 26,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.white,
+                        letterSpacing: 0.5,
                       ),
-                      const SizedBox(height: 16),
-
-                      // Username
-                      Text(
-                        widget.username,
-                        style: const TextStyle(
-                          fontSize: 26,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.white,
-                          letterSpacing: 0.5,
-                        ),
-                      ),
-                      const SizedBox(height: 6),
-
-                      // Badge Role
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 14,
-                          vertical: 4,
-                        ),
-                        decoration: BoxDecoration(
-                          color: Colors.cyanAccent.withValues(alpha: 0.15),
-                          borderRadius: BorderRadius.circular(20),
-                          border: Border.all(
-                            color: Colors.cyanAccent.withValues(alpha: 0.4),
-                          ),
-                        ),
-                        child: Text(
-                          displayRole,
-                          style: const TextStyle(
-                            fontSize: 13,
-                            fontWeight: FontWeight.w600,
-                            color: Colors.cyanAccent,
-                            letterSpacing: 0.8,
-                          ),
-                        ),
-                      ),
-
-                      const SizedBox(height: 14),
-
-                      // Tenant Info Chip
+                    ),
+                    if (_email.isNotEmpty) ...[
+                      const SizedBox(height: 4),
                       Row(
+                        mainAxisSize: MainAxisSize.min,
                         mainAxisAlignment: MainAxisAlignment.center,
                         children: [
                           const Icon(
-                            Icons.domain_rounded,
+                            Icons.email_outlined,
                             size: 15,
-                            color: Colors.white60,
+                            color: Color(0xFF00E5FF),
                           ),
                           const SizedBox(width: 6),
-                          Text(
-                            'Tenant ID: $_tenantId',
-                            style: const TextStyle(
-                              fontSize: 13,
-                              color: Colors.white70,
-                              fontWeight: FontWeight.w500,
+                          Flexible(
+                            child: Text(
+                              _email,
+                              style: const TextStyle(
+                                fontSize: 14,
+                                color: Colors.white70,
+                                fontWeight: FontWeight.w400,
+                              ),
+                              overflow: TextOverflow.ellipsis,
                             ),
                           ),
                         ],
                       ),
                     ],
-                  ),
+                    const SizedBox(height: 10),
+
+                    // Badge Role
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 4,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.cyanAccent.withValues(alpha: 0.15),
+                        borderRadius: BorderRadius.circular(20),
+                        border: Border.all(
+                          color: Colors.cyanAccent.withValues(alpha: 0.4),
+                        ),
+                      ),
+                      child: Text(
+                        displayRole,
+                        style: const TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                          color: Colors.cyanAccent,
+                          letterSpacing: 0.8,
+                        ),
+                      ),
+                    ),
+
+                    const SizedBox(height: 14),
+
+                    // Tenant Info Chip
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        const Icon(
+                          Icons.domain_rounded,
+                          size: 15,
+                          color: Colors.white60,
+                        ),
+                        const SizedBox(width: 6),
+                        Text(
+                          'Tenant ID: $_tenantId',
+                          style: const TextStyle(
+                            fontSize: 13,
+                            color: Colors.white70,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
                 ),
               ),
             ),
+          ),
 
-            const SizedBox(height: 24),
+          const SizedBox(height: 24),
 
-            // --- SECTION SHELTER INFORMATION ---
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                const Row(
-                  children: [
-                    Icon(
-                      Icons.sensors_rounded,
-                      color: Colors.cyanAccent,
-                      size: 20,
-                    ),
-                    SizedBox(width: 8),
-                    Text(
-                      'SHELTER TERHUBUNG',
-                      style: TextStyle(
-                        fontSize: 13,
-                        fontWeight: FontWeight.bold,
-                        color: Colors.white70,
-                        letterSpacing: 1.2,
-                      ),
+          // --- SECTION PENGATURAN ALARM SENSOR ---
+          Row(
+            children: [
+              const Icon(
+                Icons.alarm_on_rounded,
+                color: Colors.orangeAccent,
+                size: 20,
+              ),
+              const SizedBox(width: 8),
+              const Text(
+                'PENGATURAN ALARM',
+                style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white70,
+                  letterSpacing: 1.2,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+
+          Material(
+            color: Colors.transparent,
+            child: InkWell(
+              onTap: _openAlarmSettings,
+              borderRadius: BorderRadius.circular(18),
+              child: Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    colors: [
+                      Colors.orangeAccent.withValues(alpha: 0.18),
+                      Colors.white.withValues(alpha: 0.06),
+                    ],
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                  ),
+                  borderRadius: BorderRadius.circular(18),
+                  border: Border.all(
+                    color: Colors.orangeAccent.withValues(alpha: 0.45),
+                    width: 1.2,
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.orangeAccent.withValues(alpha: 0.12),
+                      blurRadius: 12,
+                      offset: const Offset(0, 3),
                     ),
                   ],
                 ),
-                IconButton(
-                  onPressed: () => _fetchFreshShelters(_tenantId),
-                  icon: const Icon(
-                    Icons.refresh_rounded,
+                child: Row(
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: Colors.orangeAccent.withValues(alpha: 0.25),
+                        shape: BoxShape.circle,
+                        border: Border.all(
+                          color: Colors.orangeAccent.withValues(alpha: 0.6),
+                          width: 1.2,
+                        ),
+                      ),
+                      child: const Icon(
+                        Icons.notifications_active_rounded,
+                        color: Colors.orangeAccent,
+                        size: 24,
+                      ),
+                    ),
+                    const SizedBox(width: 14),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text(
+                            'Setting Ambang Batas & Audio Alarm',
+                            style: TextStyle(
+                              fontSize: 15,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.white,
+                            ),
+                          ),
+                          const SizedBox(height: 3),
+                          Text(
+                            'Atur batas Min/Max sensor & sirene untuk $_currentShelterId',
+                            style: const TextStyle(
+                              fontSize: 12,
+                              color: Colors.white70,
+                            ),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ],
+                      ),
+                    ),
+                    const Icon(
+                      Icons.chevron_right_rounded,
+                      color: Colors.orangeAccent,
+                      size: 24,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+
+          const SizedBox(height: 24),
+
+          // --- SECTION SHELTER INFORMATION ---
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Row(
+                children: [
+                  Icon(
+                    Icons.sensors_rounded,
                     color: Colors.cyanAccent,
                     size: 20,
                   ),
-                  tooltip: 'Segarkan data shelter',
-                ),
-              ],
-            ),
-            const SizedBox(height: 10),
-
-            if (_isLoading)
-              const Padding(
-                padding: EdgeInsets.symmetric(vertical: 24),
-                child: Center(
-                  child: CircularProgressIndicator(
-                    color: Colors.cyanAccent,
+                  SizedBox(width: 8),
+                  Text(
+                    'SHELTER TERHUBUNG',
+                    style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.white70,
+                      letterSpacing: 1.2,
+                    ),
                   ),
+                ],
+              ),
+              IconButton(
+                onPressed: () => _fetchFreshShelters(_tenantId),
+                icon: const Icon(
+                  Icons.refresh_rounded,
+                  color: Colors.cyanAccent,
+                  size: 20,
                 ),
-              )
-            else if (_shelters.isEmpty)
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(20),
+                tooltip: 'Segarkan data shelter',
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+
+          if (_isLoading)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 24),
+              child: Center(
+                child: CircularProgressIndicator(color: Colors.cyanAccent),
+              ),
+            )
+          else if (_shelters.isEmpty)
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(20),
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.06),
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(color: Colors.white.withValues(alpha: 0.12)),
+              ),
+              child: const Column(
+                children: [
+                  Icon(
+                    Icons.info_outline_rounded,
+                    color: Colors.white54,
+                    size: 32,
+                  ),
+                  SizedBox(height: 8),
+                  Text(
+                    'Belum ada data shelter yang dimuat',
+                    style: TextStyle(color: Colors.white70, fontSize: 14),
+                  ),
+                ],
+              ),
+            )
+          else
+            ..._shelters.map((shelter) {
+              final isSelected = shelter.id == _currentShelterId;
+              return Container(
+                margin: const EdgeInsets.only(bottom: 12),
+                padding: const EdgeInsets.all(16),
                 decoration: BoxDecoration(
-                  color: Colors.white.withValues(alpha: 0.06),
-                  borderRadius: BorderRadius.circular(16),
+                  color: isSelected
+                      ? const Color(0xFF00E5FF).withValues(alpha: 0.12)
+                      : Colors.white.withValues(alpha: 0.06),
+                  borderRadius: BorderRadius.circular(18),
                   border: Border.all(
-                    color: Colors.white.withValues(alpha: 0.12),
-                  ),
-                ),
-                child: const Column(
-                  children: [
-                    Icon(
-                      Icons.info_outline_rounded,
-                      color: Colors.white54,
-                      size: 32,
-                    ),
-                    SizedBox(height: 8),
-                    Text(
-                      'Belum ada data shelter yang dimuat',
-                      style: TextStyle(color: Colors.white70, fontSize: 14),
-                    ),
-                  ],
-                ),
-              )
-            else
-              ..._shelters.map((shelter) {
-                final isSelected = shelter.id == _currentShelterId;
-                return Container(
-                  margin: const EdgeInsets.only(bottom: 12),
-                  padding: const EdgeInsets.all(16),
-                  decoration: BoxDecoration(
                     color: isSelected
-                        ? const Color(0xFF00E5FF).withValues(alpha: 0.12)
-                        : Colors.white.withValues(alpha: 0.06),
-                    borderRadius: BorderRadius.circular(18),
-                    border: Border.all(
-                      color: isSelected
-                          ? const Color(0xFF00E5FF).withValues(alpha: 0.6)
-                          : Colors.white.withValues(alpha: 0.12),
-                      width: isSelected ? 1.5 : 1,
-                    ),
+                        ? const Color(0xFF00E5FF).withValues(alpha: 0.6)
+                        : Colors.white.withValues(alpha: 0.12),
+                    width: isSelected ? 1.5 : 1,
                   ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      // Header Card Shelter
-                      Row(
-                        crossAxisAlignment: CrossAxisAlignment.center,
-                        children: [
-                          Container(
-                            padding: const EdgeInsets.all(8),
-                            decoration: BoxDecoration(
-                              color: isSelected
-                                  ? const Color(0xFF00E5FF).withValues(alpha: 0.2)
-                                  : Colors.white.withValues(alpha: 0.1),
-                              borderRadius: BorderRadius.circular(10),
-                            ),
-                            child: Icon(
-                              Icons.apartment_rounded,
-                              color: isSelected
-                                  ? const Color(0xFF00E5FF)
-                                  : Colors.white70,
-                              size: 22,
-                            ),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // Header Card Shelter
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.center,
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.all(8),
+                          decoration: BoxDecoration(
+                            color: isSelected
+                                ? const Color(0xFF00E5FF).withValues(alpha: 0.2)
+                                : Colors.white.withValues(alpha: 0.1),
+                            borderRadius: BorderRadius.circular(10),
                           ),
-                          const SizedBox(width: 12),
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(
-                                  shelter.name,
-                                  style: const TextStyle(
-                                    fontSize: 16,
-                                    fontWeight: FontWeight.bold,
-                                    color: Colors.white,
-                                  ),
-                                ),
-                                const SizedBox(height: 2),
-                                Text(
-                                  shelter.id,
-                                  style: const TextStyle(
-                                    fontSize: 12,
-                                    color: Colors.white60,
-                                    fontWeight: FontWeight.w500,
-                                  ),
-                                ),
-                              ],
-                            ),
+                          child: Icon(
+                            Icons.apartment_rounded,
+                            color: isSelected
+                                ? const Color(0xFF00E5FF)
+                                : Colors.white70,
+                            size: 22,
                           ),
-                          if (isSelected)
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 10,
-                                vertical: 4,
-                              ),
-                              decoration: BoxDecoration(
-                                color: const Color(0xFF00C853)
-                                    .withValues(alpha: 0.2),
-                                borderRadius: BorderRadius.circular(12),
-                                border: Border.all(
-                                  color: const Color(0xFF00C853),
-                                ),
-                              ),
-                              child: const Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Icon(
-                                    Icons.check_circle_rounded,
-                                    color: Color(0xFF00C853),
-                                    size: 13,
-                                  ),
-                                  SizedBox(width: 4),
-                                  Text(
-                                    'Aktif',
-                                    style: TextStyle(
-                                      color: Color(0xFF00C853),
-                                      fontSize: 11,
-                                      fontWeight: FontWeight.bold,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            )
-                          else
-                            OutlinedButton(
-                              onPressed: () => _switchActiveShelter(shelter),
-                              style: OutlinedButton.styleFrom(
-                                side: BorderSide(
-                                  color: Colors.white.withValues(alpha: 0.3),
-                                ),
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 10,
-                                  vertical: 4,
-                                ),
-                                minimumSize: Size.zero,
-                                tapTargetSize:
-                                    MaterialTapTargetSize.shrinkWrap,
-                                shape: RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.circular(10),
-                                ),
-                              ),
-                              child: const Text(
-                                'Pilih',
-                                style: TextStyle(
-                                  color: Colors.white70,
-                                  fontSize: 11,
-                                ),
-                              ),
-                            ),
-                        ],
-                      ),
-                      const SizedBox(height: 12),
-                      const Divider(color: Colors.white12, height: 1),
-                      const SizedBox(height: 10),
-
-                      // Parameter Details (Koordinat & Radius)
-                      Row(
-                        children: [
-                          Expanded(
-                            child: Row(
-                              children: [
-                                const Icon(
-                                  Icons.location_on_outlined,
-                                  size: 15,
-                                  color: Colors.cyanAccent,
-                                ),
-                                const SizedBox(width: 6),
-                                Expanded(
-                                  child: Text(
-                                    (shelter.latitude != null &&
-                                            shelter.longitude != null)
-                                        ? '${shelter.latitude!.toStringAsFixed(4)}, ${shelter.longitude!.toStringAsFixed(4)}'
-                                        : 'Belum diatur',
-                                    style: const TextStyle(
-                                      fontSize: 12,
-                                      color: Colors.white70,
-                                    ),
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                          Row(
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
-                              const Icon(
-                                Icons.radar_rounded,
-                                size: 15,
-                                color: Colors.amberAccent,
-                              ),
-                              const SizedBox(width: 6),
                               Text(
-                                '${shelter.geofenceRadius.toInt()} m',
+                                shelter.name,
+                                style: const TextStyle(
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.bold,
+                                  color: Colors.white,
+                                ),
+                              ),
+                              const SizedBox(height: 2),
+                              Text(
+                                shelter.id,
                                 style: const TextStyle(
                                   fontSize: 12,
-                                  color: Colors.white70,
+                                  color: Colors.white60,
+                                  fontWeight: FontWeight.w500,
                                 ),
                               ),
                             ],
                           ),
-                        ],
-                      ),
-                    ],
-                  ),
-                );
-              }),
+                        ),
+                        if (isSelected)
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 10,
+                              vertical: 4,
+                            ),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF00C853)
+                                  .withValues(alpha: 0.2),
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(
+                                color: const Color(0xFF00C853),
+                              ),
+                            ),
+                            child: const Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  Icons.check_circle_rounded,
+                                  color: Color(0xFF00C853),
+                                  size: 13,
+                                ),
+                                SizedBox(width: 4),
+                                Text(
+                                  'Aktif',
+                                  style: TextStyle(
+                                    color: Color(0xFF00C853),
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          )
+                        else
+                          OutlinedButton(
+                            onPressed: () => _switchActiveShelter(shelter),
+                            style: OutlinedButton.styleFrom(
+                              side: BorderSide(
+                                color: Colors.white.withValues(alpha: 0.3),
+                              ),
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 10,
+                                vertical: 4,
+                              ),
+                              minimumSize: Size.zero,
+                              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                            ),
+                            child: const Text(
+                              'Pilih',
+                              style: TextStyle(
+                                color: Colors.white70,
+                                fontSize: 11,
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    const Divider(color: Colors.white12, height: 1),
+                    const SizedBox(height: 10),
 
-            const SizedBox(height: 24),
-
-            // --- TOMBOL LOGOUT ---
-            SizedBox(
-              width: double.infinity,
-              height: 48,
-              child: ElevatedButton.icon(
-                onPressed: _confirmLogout,
-                icon: const Icon(Icons.logout_rounded, size: 20),
-                label: const Text(
-                  'Logout',
-                  style: TextStyle(
-                    fontSize: 15,
-                    fontWeight: FontWeight.bold,
-                    letterSpacing: 0.5,
-                  ),
+                    // Parameter Details (Koordinat & Radius)
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Row(
+                            children: [
+                              const Icon(
+                                Icons.location_on_outlined,
+                                size: 15,
+                                color: Colors.cyanAccent,
+                              ),
+                              const SizedBox(width: 6),
+                              Expanded(
+                                child: Text(
+                                  (shelter.latitude != null &&
+                                          shelter.longitude != null)
+                                      ? '${shelter.latitude!.toStringAsFixed(4)}, ${shelter.longitude!.toStringAsFixed(4)}'
+                                      : 'Belum diatur',
+                                  style: const TextStyle(
+                                    fontSize: 12,
+                                    color: Colors.white70,
+                                  ),
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        Row(
+                          children: [
+                            const Icon(
+                              Icons.radar_rounded,
+                              size: 15,
+                              color: Colors.amberAccent,
+                            ),
+                            const SizedBox(width: 6),
+                            Text(
+                              '${shelter.geofenceRadius.toInt()} m',
+                              style: const TextStyle(
+                                fontSize: 12,
+                                color: Colors.white70,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ],
                 ),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.redAccent.withValues(alpha: 0.9),
-                  foregroundColor: Colors.white,
-                  elevation: 2,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(14),
-                  ),
+              );
+            }),
+
+          const SizedBox(height: 28),
+
+          // --- TOMBOL LOGOUT ---
+          SizedBox(
+            width: double.infinity,
+            height: 48,
+            child: ElevatedButton.icon(
+              onPressed: _confirmLogout,
+              icon: const Icon(Icons.logout_rounded, size: 20),
+              label: const Text(
+                'Logout',
+                style: TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 0.5,
+                ),
+              ),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF2563EB),
+                foregroundColor: Colors.white,
+                elevation: 2,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14),
                 ),
               ),
             ),
-            const SizedBox(height: 16),
-          ],
-        ),
-      );
+          ),
+          const SizedBox(height: 12),
+
+          // --- TOMBOL HAPUS AKUN ---
+          SizedBox(
+            width: double.infinity,
+            height: 48,
+            child: OutlinedButton.icon(
+              onPressed: _isDeletingAccount ? null : _confirmDeleteAccount,
+              icon: _isDeletingAccount
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: Colors.redAccent,
+                      ),
+                    )
+                  : const Icon(
+                      Icons.delete_forever_rounded,
+                      size: 20,
+                      color: Colors.redAccent,
+                    ),
+              label: Text(
+                _isDeletingAccount ? 'Menghapus Akun...' : 'Hapus Akun',
+                style: const TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.redAccent,
+                  letterSpacing: 0.5,
+                ),
+              ),
+              style: OutlinedButton.styleFrom(
+                side: const BorderSide(color: Colors.redAccent, width: 1.2),
+                backgroundColor: Colors.redAccent.withValues(alpha: 0.08),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14),
+                ),
+              ),
+            ),
+          ),
+
+          // Jarak ekstra ke bawah agar button tidak tertutup bottom navbar
+          const SizedBox(height: 44),
+        ],
+      ),
+    );
   }
 }
-

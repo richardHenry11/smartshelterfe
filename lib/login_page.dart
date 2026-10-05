@@ -8,6 +8,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'config.dart';
 import 'register_page.dart';
 import 'sensors.dart';
+import 'app_notification.dart';
 
 class LoginPage extends StatefulWidget {
   const LoginPage({super.key});
@@ -34,7 +35,8 @@ class _LoginPageState extends State<LoginPage> {
           AppConfig.login(),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({
-            'username': _usernameController.text,
+            'username': _usernameController.text.trim(),
+            'email': _usernameController.text.trim(),
             'password': _passwordController.text,
           }),
         );
@@ -48,7 +50,12 @@ class _LoginPageState extends State<LoginPage> {
         if (response.statusCode == 200) {
           final data = jsonDecode(response.body);
           final prefs = await SharedPreferences.getInstance();
-          await prefs.setString('username', _usernameController.text);
+          final resolvedUsername =
+              data['username']?.toString() ?? _usernameController.text.trim();
+          await prefs.setString('username', resolvedUsername);
+          if (data['email'] != null) {
+            await prefs.setString('email', data['email'].toString());
+          }
           if (data['role'] != null) {
             await prefs.setString('user_role', data['role'].toString());
           }
@@ -57,7 +64,7 @@ class _LoginPageState extends State<LoginPage> {
           }
           if (data['foto_profile'] != null) {
             await prefs.setString(
-              'profile_image_server_${_usernameController.text}',
+              'profile_image_server_$resolvedUsername',
               data['foto_profile'].toString(),
             );
           }
@@ -69,7 +76,8 @@ class _LoginPageState extends State<LoginPage> {
             );
             if (shelterList.isNotEmpty) {
               final firstShelter = shelterList[0];
-              final firstShelterId = firstShelter['id']?.toString() ?? 'SHELTER-01';
+              final firstShelterId =
+                  firstShelter['id']?.toString() ?? 'SHELTER-01';
               await prefs.setString('current_shelter_id', firstShelterId);
               if (firstShelter['latitude'] != null) {
                 await prefs.setDouble(
@@ -91,24 +99,20 @@ class _LoginPageState extends State<LoginPage> {
               }
             }
           }
-          
+
           if (!mounted) return;
           Navigator.pushReplacement(
             context,
             MaterialPageRoute(
-              builder: (context) =>
-                  SensorsPage(username: _usernameController.text),
+              builder: (context) => SensorsPage(username: resolvedUsername),
             ),
           );
         } else {
           // Gagal login
           final data = jsonDecode(response.body);
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text(data["detail"] ?? 'Invalid username or password!'),
-              backgroundColor: Colors.redAccent,
-              behavior: SnackBarBehavior.floating,
-            ),
+          AppNotification.error(
+            context,
+            data["detail"] ?? 'Username/Email atau password salah!',
           );
         }
       } catch (e) {
@@ -116,12 +120,9 @@ class _LoginPageState extends State<LoginPage> {
         setState(() {
           _isLoading = false;
         });
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Error connecting to server: $e'),
-            backgroundColor: Colors.redAccent,
-            behavior: SnackBarBehavior.floating,
-          ),
+        AppNotification.error(
+          context,
+          'Gagal terhubung ke server: $e',
         );
       }
     }
@@ -189,12 +190,14 @@ class _LoginPageState extends State<LoginPage> {
                     ),
                     const SizedBox(height: 48),
 
-                    // Username Field
+                    // Email Field
                     TextFormField(
                       controller: _usernameController,
+                      keyboardType: TextInputType.emailAddress,
+                      autofillHints: const [AutofillHints.email],
                       style: const TextStyle(color: Colors.white),
                       decoration: InputDecoration(
-                        hintText: 'Email atau Nomor Telepon', // Adapted from reference image
+                        hintText: 'Email (contoh: user@gmail.com)',
                         hintStyle: const TextStyle(
                           color: Colors.white54,
                           fontSize: 14,
@@ -215,8 +218,15 @@ class _LoginPageState extends State<LoginPage> {
                         ),
                       ),
                       validator: (value) {
-                        if (value == null || value.isEmpty) {
-                          return 'Silakan masukkan username/email';
+                        if (value == null || value.trim().isEmpty) {
+                          return 'Email wajib diisi';
+                        }
+                        final email = value.trim();
+                        final emailRegex = RegExp(
+                          r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$',
+                        );
+                        if (!emailRegex.hasMatch(email)) {
+                          return 'Format email tidak valid (contoh: user@gmail.com)';
                         }
                         return null;
                       },

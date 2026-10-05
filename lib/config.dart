@@ -39,6 +39,7 @@ class AppConfig {
       useDirectLan ? 'ws://$lanHost:$lanPort' : 'wss://$domainHost';
 
   // --- Endpoint helper ---
+  static Uri tenants() => Uri.parse('$httpBase/tenants');
   static Uri login() => Uri.parse('$httpBase/login');
   static Uri register() => Uri.parse('$httpBase/register');
 
@@ -62,10 +63,22 @@ class AppConfig {
   static Uri wsSensors(String shelterId) =>
       Uri.parse('$wsBase/ws/sensors/$shelterId');
 
+  static Uri sensorThresholds({required String shelterId}) =>
+      Uri.parse('$httpBase/sensor/thresholds?shelter_id=$shelterId');
+
+  static Uri saveSensorThresholds() =>
+      Uri.parse('$httpBase/sensor/thresholds');
+
+  static Uri userProfile(String username) =>
+      Uri.parse('$httpBase/user/profile?username=${Uri.encodeComponent(username)}');
+
   static Uri uploadAvatar() => Uri.parse('$httpBase/user/avatar');
 
   static Uri deleteAvatar(String username) =>
-      Uri.parse('$httpBase/user/avatar?username=$username');
+      Uri.parse('$httpBase/user/avatar?username=${Uri.encodeComponent(username)}');
+
+  static Uri deleteAccount({required String username}) =>
+      Uri.parse('$httpBase/user/account?username=${Uri.encodeComponent(username)}');
 
   static String avatarUrl(String path) =>
       path.startsWith('http') ? path : '$httpBase$path';
